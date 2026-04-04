@@ -1,0 +1,194 @@
+// packages/database/src/types.ts
+// This file will be replaced by Supabase CLI generated types.
+// For now, define the shape manually to unblock development.
+
+export type Database = {
+  public: {
+    Tables: {
+      tenants: {
+        Row: {
+          id: string;
+          name: string;
+          email: string;
+          phone: string | null;
+          business_type: string;
+          plan: string;
+          calls_used_this_month: number;
+          calls_limit: number;
+          voicenter_credentials: string | null;
+          whatsapp_credentials: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["tenants"]["Row"], "id" | "created_at" | "updated_at" | "calls_used_this_month"> & {
+          id?: string;
+          calls_used_this_month?: number;
+        };
+        Update: Partial<Database["public"]["Tables"]["tenants"]["Insert"]>;
+      };
+      users: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          email: string;
+          role: "owner" | "admin" | "viewer";
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["users"]["Row"], "created_at">;
+        Update: Partial<Omit<Database["public"]["Tables"]["users"]["Insert"], "id">>;
+      };
+      campaigns: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          name: string;
+          status: "draft" | "active" | "paused" | "completed";
+          template_id: string | null;
+          script: string;
+          questions: Array<{ question: string; key: string; options?: string[] }>;
+          whatsapp_followup_template: string | null;
+          whatsapp_followup_link: string | null;
+          schedule_days: string[];
+          schedule_windows: Array<{ start: string; end: string }>;
+          max_concurrent_calls: number;
+          max_retry_attempts: number;
+          retry_delay_minutes: number;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["campaigns"]["Row"], "id" | "created_at" | "updated_at" | "status"> & {
+          id?: string;
+          status?: string;
+        };
+        Update: Partial<Database["public"]["Tables"]["campaigns"]["Insert"]>;
+      };
+      contacts: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          phone: string;
+          name: string | null;
+          email: string | null;
+          custom_fields: Record<string, unknown>;
+          is_dnc: boolean;
+          dnc_at: string | null;
+          dnc_source: "manual" | "opt_out" | "national_registry" | null;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["contacts"]["Row"], "id" | "created_at" | "is_dnc"> & {
+          id?: string;
+          is_dnc?: boolean;
+        };
+        Update: Partial<Database["public"]["Tables"]["contacts"]["Insert"]>;
+      };
+      campaign_contacts: {
+        Row: {
+          id: string;
+          campaign_id: string;
+          contact_id: string;
+          tenant_id: string;
+          status: "pending" | "queued" | "calling" | "completed" | "failed" | "no_answer" | "dnc";
+          attempt_count: number;
+          next_retry_at: string | null;
+          call_id: string | null;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["campaign_contacts"]["Row"], "id" | "created_at" | "status" | "attempt_count"> & {
+          id?: string;
+          status?: string;
+          attempt_count?: number;
+        };
+        Update: Partial<Database["public"]["Tables"]["campaign_contacts"]["Insert"]>;
+      };
+      calls: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          campaign_id: string;
+          contact_id: string;
+          campaign_contact_id: string;
+          voicenter_call_id: string | null;
+          status: "initiated" | "ringing" | "connected" | "completed" | "failed" | "no_answer" | "dead_letter";
+          failure_reason: string | null;
+          started_at: string | null;
+          ended_at: string | null;
+          duration_seconds: number | null;
+          recording_path: string | null;
+          lead_score: number | null;
+          lead_status: "hot" | "warm" | "cold" | "not_interested" | "callback" | null;
+          qualification_answers: Record<string, string> | null;
+          whatsapp_sent: boolean;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["calls"]["Row"], "id" | "created_at" | "whatsapp_sent"> & {
+          id?: string;
+          whatsapp_sent?: boolean;
+        };
+        Update: Partial<Database["public"]["Tables"]["calls"]["Insert"]>;
+      };
+      call_transcripts: {
+        Row: {
+          id: string;
+          call_id: string;
+          tenant_id: string;
+          transcript: Array<{ role: string; text: string; timestamp: string }>;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["call_transcripts"]["Row"], "id" | "created_at">;
+        Update: Partial<Database["public"]["Tables"]["call_transcripts"]["Insert"]>;
+      };
+      templates: {
+        Row: {
+          id: string;
+          tenant_id: string | null;
+          name: string;
+          business_type: string;
+          script: string;
+          questions: Array<{ question: string; key: string; options?: string[] }>;
+          whatsapp_template: string | null;
+          is_system: boolean;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["templates"]["Row"], "id" | "created_at" | "is_system"> & {
+          id?: string;
+          is_system?: boolean;
+        };
+        Update: Partial<Database["public"]["Tables"]["templates"]["Insert"]>;
+      };
+      audit_log: {
+        Row: {
+          id: string;
+          tenant_id: string;
+          action: string;
+          entity_type: string;
+          entity_id: string | null;
+          details: Record<string, unknown> | null;
+          created_at: string;
+        };
+        Insert: Omit<Database["public"]["Tables"]["audit_log"]["Row"], "id" | "created_at">;
+        Update: never; // Immutable
+      };
+    };
+    Functions: {
+      increment_calls_used: {
+        Args: { p_tenant_id: string };
+        Returns: number;
+      };
+      reset_monthly_usage: {
+        Args: Record<string, never>;
+        Returns: void;
+      };
+    };
+  };
+};
+
+// Convenience type aliases
+export type Tenant = Database["public"]["Tables"]["tenants"]["Row"];
+export type User = Database["public"]["Tables"]["users"]["Row"];
+export type Campaign = Database["public"]["Tables"]["campaigns"]["Row"];
+export type Contact = Database["public"]["Tables"]["contacts"]["Row"];
+export type CampaignContact = Database["public"]["Tables"]["campaign_contacts"]["Row"];
+export type Call = Database["public"]["Tables"]["calls"]["Row"];
+export type CallTranscript = Database["public"]["Tables"]["call_transcripts"]["Row"];
+export type Template = Database["public"]["Tables"]["templates"]["Row"];
+export type AuditLogEntry = Database["public"]["Tables"]["audit_log"]["Row"];
