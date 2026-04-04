@@ -14,6 +14,13 @@ export const config = {
   whatsappAccessToken: process.env.WHATSAPP_ACCESS_TOKEN!,
   whatsappPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID!,
   callHardTimeoutMs: Number(process.env.CALL_HARD_TIMEOUT_MS ?? 300_000), // 5 minutes
+
+  // Compliance
+  recordingConsentEnabled: process.env.RECORDING_CONSENT_ENABLED !== "false",
+  dncFailClosed: process.env.DNC_FAIL_CLOSED !== "false", // Block call if DNC check errors
+
+  // Schedule enforcement
+  defaultTimezone: "Asia/Jerusalem",
 } as const;
 
 // Validate required env vars at startup
