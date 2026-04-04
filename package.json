@@ -1,0 +1,16 @@
+{
+  "name": "voice-agent-marketing",
+  "private": true,
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "dev:dashboard": "turbo run dev --filter=@vam/dashboard",
+    "dev:voice-engine": "turbo run dev --filter=@vam/voice-engine",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.5.0"
+  }
+}
