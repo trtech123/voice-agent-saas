@@ -2,24 +2,30 @@
 import Fastify from "fastify";
 import { config } from "./config.js";
 import { createCallWorker, createMonthlyResetScheduler, createCallQueue } from "./worker.js";
+import { getActiveBridgeCount } from "./call-bridge.js";
 
 const app = Fastify({ logger: true });
 
-// Health check endpoint
+// Health check endpoint — includes active bridge count for monitoring
 app.get("/health", async () => {
-  return { status: "ok", service: "voice-engine" };
+  return {
+    status: "ok",
+    service: "voice-engine",
+    activeBridges: getActiveBridgeCount(),
+    uptime: process.uptime(),
+  };
 });
 
 async function start() {
   // Start BullMQ workers
-  const callWorker = createCallWorker();
+  const callWorker = createCallWorker(app.log);
   const callQueue = createCallQueue();
   const { worker: resetWorker } = createMonthlyResetScheduler();
 
   app.log.info("[voice-engine] BullMQ call worker started");
   app.log.info("[voice-engine] Monthly reset scheduler started");
 
-  // Graceful shutdown
+  // Graceful shutdown — close bridges, drain workers
   const shutdown = async () => {
     app.log.info("[voice-engine] Shutting down...");
     await callWorker.close();

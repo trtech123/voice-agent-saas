@@ -1,7 +1,8 @@
 // apps/voice-engine/src/worker.ts
-import { Worker, Queue } from "bullmq";
+import { Worker, Queue, type Job } from "bullmq";
 import { createSupabaseAdmin } from "@vam/database";
 import { config } from "./config.js";
+import { processCallJob, handleDeadLetter } from "./call-processor.js";
 
 export const CALL_QUEUE_NAME = "call-jobs";
 export const MONTHLY_RESET_QUEUE_NAME = "monthly-reset";
@@ -26,22 +27,36 @@ export function createCallQueue() {
   });
 }
 
-export function createCallWorker(concurrency = 10) {
-  const db = createSupabaseAdmin(config.supabaseUrl, config.supabaseServiceRoleKey);
+/**
+ * Enqueue a call job.
+ * Campaign-scoped concurrency is enforced at the processor level
+ * by checking active bridge count per campaign before starting a call.
+ */
+export async function enqueueCallJob(
+  queue: Queue<CallJobData>,
+  data: CallJobData,
+  options?: {
+    delay?: number;
+  }
+): Promise<void> {
+  await queue.add(`call:${data.campaignId}`, data, {
+    delay: options?.delay,
+  });
+}
 
+export function createCallWorker(
+  log: {
+    info: (...args: unknown[]) => void;
+    warn: (...args: unknown[]) => void;
+    error: (...args: unknown[]) => void;
+    child: (bindings: Record<string, unknown>) => any;
+  },
+  concurrency = 10
+) {
   const worker = new Worker<CallJobData>(
     CALL_QUEUE_NAME,
-    async (job) => {
-      const { tenantId, campaignId, contactId, campaignContactId } = job.data;
-      console.log(`[call-worker] Processing call job: tenant=${tenantId} campaign=${campaignId} contact=${contactId}`);
-
-      // Placeholder — Phase 2 will implement the full call flow:
-      // 1. Validate DNC, schedule, call limit
-      // 2. Initiate Voicenter call
-      // 3. Bridge audio to Gemini Live
-      // 4. Process results
-      // For now, just log and mark as completed
-      console.log(`[call-worker] Call job completed (placeholder): ${job.id}`);
+    async (job: Job<CallJobData>) => {
+      await processCallJob(job, log);
     },
     {
       connection: redisConnection,
@@ -49,8 +64,15 @@ export function createCallWorker(concurrency = 10) {
     }
   );
 
-  worker.on("failed", (job, err) => {
-    console.error(`[call-worker] Job ${job?.id} failed:`, err.message);
+  worker.on("failed", async (job, err) => {
+    if (job) {
+      log.error({ jobId: job.id, error: err.message }, "Call job failed permanently");
+      await handleDeadLetter(job.data, err.message, log);
+    }
+  });
+
+  worker.on("error", (err) => {
+    log.error({ error: err.message }, "Call worker error");
   });
 
   return worker;
@@ -62,7 +84,7 @@ export function createMonthlyResetScheduler() {
   // Add repeatable job: 1st of each month at 00:00 IST (UTC+2/+3)
   queue.upsertJobScheduler(
     "monthly-reset",
-    { pattern: "0 0 1 * *" }, // cron: midnight on 1st of month
+    { pattern: "0 0 1 * *" },
     {
       name: "reset-monthly-usage",
       data: {},
