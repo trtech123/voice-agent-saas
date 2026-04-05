@@ -83,6 +83,11 @@ export type Database = {
           max_concurrent_calls: number;
           max_retry_attempts: number;
           retry_delay_minutes: number;
+          webhook_enabled: boolean;
+          webhook_secret_hash: string | null;
+          webhook_source_label: string | null;
+          webhook_payload_example: Record<string, unknown> | null;
+          webhook_last_rotated_at: string | null;
           created_at: string;
           updated_at: string;
         };
@@ -101,6 +106,11 @@ export type Database = {
           max_concurrent_calls: number;
           max_retry_attempts: number;
           retry_delay_minutes: number;
+          webhook_enabled?: boolean;
+          webhook_secret_hash?: string | null;
+          webhook_source_label?: string | null;
+          webhook_payload_example?: Record<string, unknown> | null;
+          webhook_last_rotated_at?: string | null;
         };
         Update: {
           id?: string;
@@ -117,6 +127,11 @@ export type Database = {
           max_concurrent_calls?: number;
           max_retry_attempts?: number;
           retry_delay_minutes?: number;
+          webhook_enabled?: boolean;
+          webhook_secret_hash?: string | null;
+          webhook_source_label?: string | null;
+          webhook_payload_example?: Record<string, unknown> | null;
+          webhook_last_rotated_at?: string | null;
           updated_at?: string;
         };
         Relationships: [];

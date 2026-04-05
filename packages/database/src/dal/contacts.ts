@@ -40,6 +40,18 @@ export class ContactDAL {
     return data ?? [];
   }
 
+  async upsertOne(
+    contact: Omit<Database["public"]["Tables"]["contacts"]["Insert"], "tenant_id">
+  ): Promise<Contact> {
+    const { data, error } = await this.db
+      .from("contacts")
+      .upsert({ ...contact, tenant_id: this.tenantId }, { onConflict: "tenant_id,phone" })
+      .select("*")
+      .single();
+    if (error) throw error;
+    return data;
+  }
+
   async markDnc(contactId: string, source: "manual" | "opt_out" | "national_registry"): Promise<void> {
     const { error } = await this.db
       .from("contacts")

@@ -22,7 +22,7 @@ export function Topbar() {
 
   return (
     <header
-      className="sticky top-0 z-30 glass-strong h-16 flex items-center justify-between px-6 mr-64"
+      className="sticky top-0 z-30 glass-strong h-16 flex items-center justify-between px-6"
       style={{ borderBottom: "1px solid #E2E8F0" }}
     >
       {/* Business name / breadcrumb */}

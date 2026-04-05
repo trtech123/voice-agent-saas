@@ -19,6 +19,21 @@ export class CampaignContactDAL {
     return data;
   }
 
+  async getByCampaignAndContact(
+    campaignId: string,
+    contactId: string
+  ): Promise<CampaignContact | null> {
+    const { data, error } = await this.db
+      .from("campaign_contacts")
+      .select("*")
+      .eq("campaign_id", campaignId)
+      .eq("contact_id", contactId)
+      .eq("tenant_id", this.tenantId)
+      .single();
+    if (error && error.code !== "PGRST116") throw error;
+    return data;
+  }
+
   async listPending(campaignId: string, limit: number): Promise<CampaignContact[]> {
     const now = new Date().toISOString();
     const { data, error } = await this.db
