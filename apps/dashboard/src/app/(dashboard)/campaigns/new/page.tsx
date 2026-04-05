@@ -19,7 +19,7 @@ export default async function NewCampaignPage() {
 
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-6">קמפיין חדש</h1>
+      <h1 className="text-2xl font-bold text-[#1E1B4B] mb-8">קמפיין חדש</h1>
       <WizardShell templates={templates ?? []} tenantId={tenantId} />
     </div>
   );

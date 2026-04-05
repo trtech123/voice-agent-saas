@@ -17,9 +17,21 @@ export function DashboardClient({ tenantId, hotLeads, chartData }: DashboardClie
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <LiveCallFeed calls={liveCalls} />
-      <HotLeadsCard leads={hotLeads} />
-      <div className="lg:col-span-2">
+      {/* Live call feed */}
+      <div className="bg-white/80 backdrop-blur-sm border border-white/20 rounded-xl shadow-md p-5">
+        <h2 className="text-lg font-semibold text-[#1E1B4B] mb-4">שיחות בזמן אמת</h2>
+        <LiveCallFeed calls={liveCalls} />
+      </div>
+
+      {/* Hot leads */}
+      <div className="bg-white/80 backdrop-blur-sm border border-white/20 rounded-xl shadow-md p-5">
+        <h2 className="text-lg font-semibold text-[#1E1B4B] mb-4">לידים חמים</h2>
+        <HotLeadsCard leads={hotLeads} />
+      </div>
+
+      {/* Performance chart */}
+      <div className="lg:col-span-2 bg-white/80 backdrop-blur-sm border border-white/20 rounded-xl shadow-md p-5">
+        <h2 className="text-lg font-semibold text-[#1E1B4B] mb-4">ביצועים</h2>
         <PerformanceChart data={chartData} />
       </div>
     </div>

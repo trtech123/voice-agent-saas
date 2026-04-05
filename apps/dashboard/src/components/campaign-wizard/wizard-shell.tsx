@@ -8,6 +8,7 @@ import { StepScript } from "./step-script";
 import { StepContacts } from "./step-contacts";
 import { StepSchedule } from "./step-schedule";
 import { StepReview } from "./step-review";
+import { Check, ChevronLeft, ChevronRight, Rocket } from "lucide-react";
 import type { Template } from "@vam/database";
 
 const STEP_LABELS = [
@@ -35,7 +36,7 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
 
   function canProceed(): boolean {
     switch (step) {
-      case 0: return true; // Template is optional (can start blank)
+      case 0: return true;
       case 1: return state.name.trim().length > 0 && state.script.trim().length > 0;
       case 2: return state.uploadResult !== null && state.uploadResult.contactCount > 0;
       case 3: return state.scheduleDays.length > 0 && state.scheduleWindows.length > 0;
@@ -84,37 +85,60 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
   return (
     <div>
       {/* Step indicator */}
-      <nav className="flex items-center gap-2 mb-8" aria-label="שלבי האשף">
-        {STEP_LABELS.map((label, idx) => (
-          <div key={idx} className="flex items-center gap-2">
-            <button
-              onClick={() => idx < step && setStep(idx)}
-              disabled={idx > step}
-              className={`
-                flex items-center gap-2 text-sm font-medium px-3 py-1.5 rounded-full transition-colors
-                ${idx === step
-                  ? "bg-blue-600 text-white"
-                  : idx < step
-                    ? "bg-blue-100 text-blue-700 hover:bg-blue-200 cursor-pointer"
-                    : "bg-gray-100 text-gray-400 cursor-not-allowed"
-                }
-              `}
-              aria-current={idx === step ? "step" : undefined}
-            >
-              <span className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-xs">
-                {idx < step ? "\u2713" : idx + 1}
-              </span>
-              <span className="hidden sm:inline">{label}</span>
-            </button>
-            {idx < STEP_LABELS.length - 1 && (
-              <div className={`w-8 h-0.5 ${idx < step ? "bg-blue-300" : "bg-gray-200"}`} />
-            )}
-          </div>
-        ))}
+      <nav className="flex items-center justify-center gap-0 mb-8" aria-label="שלבי האשף">
+        {STEP_LABELS.map((label, idx) => {
+          const isActive = idx === step;
+          const isCompleted = idx < step;
+          return (
+            <div key={idx} className="flex items-center">
+              <button
+                onClick={() => idx < step && setStep(idx)}
+                disabled={idx > step}
+                className={`
+                  flex items-center gap-2.5 transition-all duration-200
+                  ${idx <= step ? "cursor-pointer" : "cursor-not-allowed"}
+                  focus:outline-none focus:ring-2 focus:ring-indigo-400/50 focus:ring-offset-2 rounded-full
+                `}
+                aria-current={isActive ? "step" : undefined}
+              >
+                <span
+                  className={`
+                    w-8 h-8 rounded-full flex items-center justify-center text-sm font-semibold
+                    transition-all duration-200 shrink-0
+                    ${isActive
+                      ? "bg-indigo-500 text-white shadow-md shadow-indigo-200"
+                      : isCompleted
+                        ? "bg-emerald-500 text-white"
+                        : "bg-white/60 text-[#1E1B4B]/30 border border-white/40"
+                    }
+                  `}
+                >
+                  {isCompleted ? <Check className="w-4 h-4" /> : idx + 1}
+                </span>
+                <span
+                  className={`
+                    hidden md:inline text-sm font-medium transition-colors duration-200
+                    ${isActive ? "text-[#1E1B4B]" : isCompleted ? "text-emerald-600" : "text-[#1E1B4B]/30"}
+                  `}
+                >
+                  {label}
+                </span>
+              </button>
+              {idx < STEP_LABELS.length - 1 && (
+                <div
+                  className={`
+                    w-8 lg:w-12 h-0.5 mx-2 rounded-full transition-colors duration-200
+                    ${isCompleted ? "bg-emerald-400" : "bg-white/40"}
+                  `}
+                />
+              )}
+            </div>
+          );
+        })}
       </nav>
 
-      {/* Step content */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
+      {/* Step content in glassmorphism card */}
+      <div className="bg-white/80 backdrop-blur-sm border border-white/20 rounded-xl shadow-md p-6">
         {step === 0 && (
           <StepTemplate
             templates={templates}
@@ -138,7 +162,9 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
 
       {/* Error */}
       {error && (
-        <p className="text-red-600 text-sm mt-4" role="alert">{error}</p>
+        <div className="mt-4 bg-red-50/80 backdrop-blur-sm border border-red-200/40 rounded-xl p-3">
+          <p className="text-red-600 text-sm" role="alert">{error}</p>
+        </div>
       )}
 
       {/* Navigation buttons */}
@@ -148,6 +174,7 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
           onClick={() => setStep((s) => s - 1)}
           disabled={step === 0}
         >
+          <ChevronRight className="w-4 h-4" />
           הקודם
         </Button>
 
@@ -157,6 +184,7 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
             disabled={!canProceed()}
           >
             הבא
+            <ChevronLeft className="w-4 h-4" />
           </Button>
         ) : (
           <Button
@@ -164,6 +192,7 @@ export function WizardShell({ templates, tenantId }: WizardShellProps) {
             loading={launching}
             disabled={!canProceed()}
           >
+            <Rocket className="w-4 h-4" />
             הפעל קמפיין
           </Button>
         )}
