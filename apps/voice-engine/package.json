@@ -11,6 +11,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@fastify/websocket": "^11.2.0",
     "@vam/database": "*",
     "bullmq": "^5.0.0",
     "dotenv": "^16.4.0",
@@ -19,7 +20,7 @@
   },
   "devDependencies": {
     "@types/ws": "^8.5.0",
-    "vitest": "^2.0.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
   }
 }

@@ -75,6 +75,8 @@ export interface CallBridgeConfig {
   };
   toolContext: ToolExecutionContext;
   voicenterClient: VoicenterClient;
+  /** Optional callback to send control messages to the gateway WebSocket */
+  onGatewayControl?: (message: Record<string, unknown>) => void;
   log: {
     info: (...args: unknown[]) => void;
     warn: (...args: unknown[]) => void;
@@ -468,6 +470,13 @@ export class CallBridge {
       this.endProtectedAssistantTurn("gemini_ws_closed");
     }
 
+    // Notify gateway that Gemini disconnected so it can clear its gate
+    this.cfg.onGatewayControl?.({
+      event: "gemini_disconnected",
+      code,
+      reason,
+    });
+
     const isAbnormal = code !== 1000 && this.gemini.isReady;
     if (isAbnormal && this.geminiReconnectCount < MAX_GEMINI_RECONNECTS) {
       this.log.warn(
@@ -490,6 +499,14 @@ export class CallBridge {
     this.protectedAssistantTurnCount += 1;
     this.currentTurnTranscript = "";
     this.correctionCheckedThisTurn = false;
+
+    // Notify gateway to activate its own half-duplex gate
+    this.cfg.onGatewayControl?.({
+      event: "assistant_turn_state",
+      protected: true,
+      phase: _reason,
+      turnIndex: this.protectedAssistantTurnCount,
+    });
   }
 
   private endProtectedAssistantTurn(reason: string): void {
@@ -500,6 +517,14 @@ export class CallBridge {
         ? POST_GENERATION_PLAYBACK_TAIL_MS
         : HALF_DUPLEX_RELEASE_MS;
     this.suppressCallerAudioUntil = Date.now() + playbackTailMs;
+
+    // Notify gateway to release its own half-duplex gate
+    this.cfg.onGatewayControl?.({
+      event: "assistant_turn_state",
+      protected: false,
+      phase: reason,
+      turnIndex: this.protectedAssistantTurnCount,
+    });
   }
 
   // ─── Watchdog (two-tiered, from FC) ──────────────────────────────

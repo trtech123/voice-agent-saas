@@ -1,8 +1,10 @@
 // apps/voice-engine/src/index.ts
 import Fastify from "fastify";
+import fastifyWebSocket from "@fastify/websocket";
 import { config } from "./config.js";
 import { createCallWorker, createMonthlyResetScheduler, createCallQueue } from "./worker.js";
 import { getActiveBridgeCount } from "./call-bridge.js";
+import { registerSipRoutes } from "./sip-routes.js";
 
 const app = Fastify({ logger: true });
 
@@ -17,6 +19,12 @@ app.get("/health", async () => {
 });
 
 async function start() {
+  // Register WebSocket support (required for gateway media stream)
+  await app.register(fastifyWebSocket);
+
+  // Register SIP gateway callback routes (POST /api/v1/sip-events, WS /api/v1/media-stream)
+  await registerSipRoutes(app);
+
   // Start BullMQ workers
   const callWorker = createCallWorker(app.log);
   const callQueue = createCallQueue();

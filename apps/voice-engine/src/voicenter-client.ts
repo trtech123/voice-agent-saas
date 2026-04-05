@@ -220,9 +220,37 @@ export class VoicenterClient {
   }
 
   /**
+   * Attach an externally-managed WebSocket (from the SIP routes module)
+   * instead of making an outbound connection via connectMediaStream.
+   *
+   * This is the preferred path: the gateway connects *to us*, and the
+   * sip-routes module hands us the socket.
+   */
+  attachGatewaySocket(ws: WebSocket): void {
+    this.mediaWs = ws;
+    this.log.info("Attached gateway-initiated media WebSocket to VoicenterClient");
+  }
+
+  /**
+   * Set a custom send function for routing audio through the SIP routes
+   * module instead of directly through a WebSocket reference.
+   */
+  setSendFn(fn: (audioBase64: string, mimeType: string) => void): void {
+    this._customSendFn = fn;
+  }
+
+  private _customSendFn: ((audioBase64: string, mimeType: string) => void) | null = null;
+
+  /**
    * Send audio data to the caller via the media stream WebSocket.
    */
   sendAudio(audioBase64: string, mimeType: string): void {
+    // Prefer custom send function (uses sip-routes gateway socket)
+    if (this._customSendFn) {
+      this._customSendFn(audioBase64, mimeType);
+      return;
+    }
+
     if (!this.mediaWs || this.mediaWs.readyState !== WebSocket.OPEN) {
       return;
     }

@@ -30,6 +30,12 @@ import {
 import { config } from "./config.js";
 import { CallBridge, type CallBridgeResult } from "./call-bridge.js";
 import { VoicenterClient, parseVoicenterCredentials } from "./voicenter-client.js";
+import {
+  registerPendingCall,
+  attachMediaEvents,
+  removePendingCall,
+  sendToGateway,
+} from "./sip-routes.js";
 import type { ToolExecutionContext } from "./tools.js";
 import type { CallJobData } from "./worker.js";
 
@@ -314,38 +320,30 @@ export async function processCallJob(
     attemptCount: campaignContact.attempt_count + 1,
   });
 
-  // -- Step 4: Decrypt Voicenter credentials --
-  if (!tenant.voicenter_credentials) {
-    jobLog.error("Tenant has no Voicenter credentials configured");
-    await callDal.markDeadLetter(callId, "no_voicenter_credentials");
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
-    return;
-  }
+  // -- Step 4: Initialize SIP gateway client --
+  // MVP: All tenants share the same Voicenter trunk via the Asterisk gateway.
+  // Per-tenant SIP credentials are a post-MVP feature.
+  const voicenterClient = new VoicenterClient(
+    { apiKey: config.sipGatewayApiKey, callerId: "", tenantId },
+    jobLog
+  );
 
-  let voicenterCreds;
-  try {
-    const decrypted = decryptCredential(tenant.voicenter_credentials, config.credentialKek);
-    voicenterCreds = parseVoicenterCredentials(decrypted);
-  } catch (err) {
-    jobLog.error({ err }, "Failed to decrypt Voicenter credentials");
-    await callDal.markDeadLetter(callId, "credential_decryption_failed");
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
-    return;
-  }
+  // -- Step 5: Register pending call + initiate outbound call --
+  // Register the call in the SIP routes module so inbound gateway
+  // connections (lifecycle events + media WebSocket) can be matched.
+  registerPendingCall(callId);
 
-  // -- Step 5: Initiate outbound call --
-  const voicenterClient = new VoicenterClient(voicenterCreds, jobLog);
-
-  // Build webhook/media URLs for the SIP gateway callback
-  const voiceEngineBaseUrl = config.sipGatewayBaseUrl
-    ? `http://localhost:${config.port}` // In production, use the Railway public URL
+  // Voice engine public URL for gateway callbacks
+  const voiceEnginePublicUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
     : `http://localhost:${config.port}`;
-  const eventWebhookUrl = `${voiceEngineBaseUrl}/api/v1/sip-events`;
-  const mediaStreamUrl = `ws://localhost:${config.port}/api/v1/media-stream`;
+  const eventWebhookUrl = `${voiceEnginePublicUrl}/api/v1/sip-events`;
+  const mediaStreamWsUrl = voiceEnginePublicUrl.replace("https://", "wss://").replace("http://", "ws://")
+    + `/api/v1/media-stream?callId=${encodeURIComponent(callId)}`;
 
   const callResult = await voicenterClient.initiateCall(contact.phone, callId, {
     eventWebhookUrl,
-    mediaStreamUrl,
+    mediaStreamUrl: mediaStreamWsUrl,
   });
   if (!callResult.success) {
     jobLog.error(
@@ -358,6 +356,7 @@ export async function processCallJob(
       ended_at: new Date().toISOString(),
     });
     await campaignContactDal.updateStatus(campaignContactId, "failed");
+    removePendingCall(callId);
     return;
   }
 
@@ -424,20 +423,39 @@ export async function processCallJob(
     },
     toolContext,
     voicenterClient,
+    onGatewayControl: (msg) => sendToGateway(callId, msg),
     log: jobLog,
   });
 
-  // Connect Voicenter media stream to bridge
-  const mediaEvents = bridge.getMediaEvents();
-  voicenterClient.connectMediaStream(callResult.mediaStreamUrl ?? mediaStreamUrl, mediaEvents);
+  // Wire outbound audio: bridge -> VoicenterClient -> gateway WebSocket
+  // Instead of the old outbound connectMediaStream, we route audio through
+  // the sip-routes pending call registry where the gateway connects to us.
+  voicenterClient.setSendFn((audioBase64, mimeType) => {
+    sendToGateway(callId, {
+      event: "media",
+      audio: { data: audioBase64, mimeType },
+    });
+  });
 
   // Update call status to connected
   await callDal.update(callId, { status: "connected" });
 
-  // Wait for bridge to complete (call ends)
+  // Wait for bridge to complete (call ends).
+  // bridge.start() sets _mediaEvents synchronously inside its Promise
+  // constructor, so we capture the promise without awaiting, attach the
+  // media events to the sip-routes pending call, then await completion.
   let bridgeResult: CallBridgeResult;
+  const bridgePromise = bridge.start();
+
+  // Now _mediaEvents is set — wire them into the sip-routes registry
+  // so inbound gateway WebSocket messages reach the bridge.
+  const mediaEvents = bridge.getMediaEvents();
+  if (mediaEvents) {
+    attachMediaEvents(callId, mediaEvents);
+  }
+
   try {
-    bridgeResult = await bridge.start();
+    bridgeResult = await bridgePromise;
   } catch (err) {
     jobLog.error({ err }, "Call bridge threw unexpectedly");
     await callDal.update(callId, {
@@ -447,6 +465,7 @@ export async function processCallJob(
     });
     await campaignContactDal.updateStatus(campaignContactId, "failed");
     voicenterClient.cleanup();
+    removePendingCall(callId);
     return;
   }
 
@@ -461,9 +480,10 @@ export async function processCallJob(
     "Call bridge completed, starting post-call processing"
   );
 
-  // Hang up Voicenter call
+  // Hang up Voicenter call and clean up pending call registry
   await voicenterClient.hangup();
   voicenterClient.cleanup();
+  removePendingCall(callId);
 
   // Determine final call status
   const isNoAnswer =
