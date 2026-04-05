@@ -1,15 +1,17 @@
 // apps/voice-engine/src/voicenter-client.ts
 
 /**
- * Voicenter API client for outbound call initiation and media streaming.
+ * Asterisk SIP Gateway client for outbound call initiation and media streaming.
  *
- * Manages:
- * - Outbound call initiation via Voicenter REST API
- * - Media stream WebSocket connection for real-time audio
- * - Call status tracking and cleanup
+ * Replaces the previous direct Voicenter REST API integration. Calls are now
+ * routed through the Asterisk gateway running on the DigitalOcean droplet
+ * (POST /calls), which handles SIP signaling via Voicenter's PJSIP trunk.
  *
- * NOTE: Voicenter API contract is based on expected interface.
- * Adjust endpoints/payloads once Voicenter documentation is confirmed.
+ * Media streams flow over WebSocket between the voice engine (Railway) and
+ * the gateway, which bridges audio into/out of the Asterisk channel.
+ *
+ * Lifecycle events (dialing, ringing, connected, ended, etc.) are pushed
+ * from the gateway to the voice engine via the eventWebhookUrl callback.
  */
 
 import WebSocket from "ws";
@@ -17,21 +19,20 @@ import { config } from "./config.js";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
-export interface VoicenterCredentials {
+export interface SipGatewayCredentials {
   apiKey: string;
   callerId: string;
-  accountId: string;
-  mediaStreamUrl?: string;
+  tenantId: string;
 }
 
 export interface OutboundCallResult {
   success: boolean;
-  voicenterCallId: string | null;
+  sipCallId: string | null;
   mediaStreamUrl: string | null;
   error?: string;
 }
 
-export interface VoicenterMediaStreamEvents {
+export interface SipGatewayMediaStreamEvents {
   onAudio: (audioData: string, mimeType: string) => void;
   onCallConnected: (metadata: { from?: string; to?: string; streamId?: string }) => void;
   onCallEnded: (reason: string) => void;
@@ -41,52 +42,58 @@ export interface VoicenterMediaStreamEvents {
 // ─── Client ─────────────────────────────────────────────────────────
 
 export class VoicenterClient {
-  private baseUrl: string;
+  private gatewayBaseUrl: string;
   private mediaWs: WebSocket | null = null;
-  private callId: string | null = null;
+  private sipCallId: string | null = null;
 
   constructor(
-    private credentials: VoicenterCredentials,
+    private credentials: SipGatewayCredentials,
     private log: {
       info: (...args: unknown[]) => void;
       warn: (...args: unknown[]) => void;
       error: (...args: unknown[]) => void;
     }
   ) {
-    this.baseUrl = config.voicenterApiUrl;
+    this.gatewayBaseUrl = config.sipGatewayBaseUrl.replace(/\/+$/, "");
   }
 
   /**
-   * Initiate an outbound call via Voicenter REST API.
-   * Returns the call ID and media stream URL for WebSocket connection.
+   * Initiate an outbound call via the Asterisk SIP gateway.
+   *
+   * The gateway creates an Asterisk bridge, dials the target number over
+   * the Voicenter PJSIP trunk, and returns a sipCallId. The voice engine
+   * should provide a mediaStreamUrl (WebSocket endpoint) where the gateway
+   * will connect to relay bidirectional audio.
    */
   async initiateCall(
     toPhone: string,
-    internalCallId: string
+    internalCallId: string,
+    options: {
+      eventWebhookUrl: string;
+      mediaStreamUrl: string;
+    }
   ): Promise<OutboundCallResult> {
     this.log.info(
       { to: redactPhone(toPhone), callerId: this.credentials.callerId },
-      "Initiating outbound call via Voicenter"
+      "Initiating outbound call via SIP gateway"
     );
 
     try {
-      const response = await fetch(`${this.baseUrl}/api/v1/calls/outbound`, {
+      const response = await fetch(`${this.gatewayBaseUrl}/calls`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${this.credentials.apiKey}`,
-          "X-Account-Id": this.credentials.accountId,
+          Authorization: `Bearer ${config.sipGatewayApiKey}`,
         },
         body: JSON.stringify({
+          callId: internalCallId,
           to: toPhone,
-          from: this.credentials.callerId,
-          callbackUrl: null, // We use WebSocket media stream instead of webhooks
-          metadata: { internalCallId },
-          mediaStream: {
-            enabled: true,
-            format: "pcm16", // 16-bit PCM, 16kHz mono
-            sampleRate: 16000,
-            channels: 1,
+          eventWebhookUrl: options.eventWebhookUrl,
+          mediaStreamUrl: options.mediaStreamUrl,
+          tenantId: this.credentials.tenantId,
+          metadata: {
+            callerId: this.credentials.callerId,
+            tenantId: this.credentials.tenantId,
           },
         }),
       });
@@ -95,39 +102,43 @@ export class VoicenterClient {
         const errorText = await response.text();
         this.log.error(
           { status: response.status, error: errorText },
-          "Voicenter outbound call failed"
+          "SIP gateway outbound call failed"
         );
         return {
           success: false,
-          voicenterCallId: null,
+          sipCallId: null,
           mediaStreamUrl: null,
-          error: `Voicenter API error: ${response.status} ${errorText}`,
+          error: `SIP gateway error: ${response.status} ${errorText}`,
         };
       }
 
       const data = (await response.json()) as {
-        callId: string;
-        mediaStreamUrl: string;
+        success: boolean;
+        sipCallId: string;
+        status: string;
+        bridgeId: string;
+        customerChannelId: string;
+        mediaChannelId: string;
       };
 
-      this.callId = data.callId;
+      this.sipCallId = data.sipCallId;
 
       this.log.info(
-        { voicenterCallId: data.callId },
-        "Voicenter outbound call initiated"
+        { sipCallId: data.sipCallId, status: data.status },
+        "SIP gateway outbound call initiated"
       );
 
       return {
         success: true,
-        voicenterCallId: data.callId,
-        mediaStreamUrl: data.mediaStreamUrl,
+        sipCallId: data.sipCallId,
+        mediaStreamUrl: options.mediaStreamUrl,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.log.error({ err }, "Voicenter call initiation threw");
+      this.log.error({ err }, "SIP gateway call initiation threw");
       return {
         success: false,
-        voicenterCallId: null,
+        sipCallId: null,
         mediaStreamUrl: null,
         error: message,
       };
@@ -135,22 +146,28 @@ export class VoicenterClient {
   }
 
   /**
-   * Connect to the Voicenter media stream WebSocket.
+   * Connect to the gateway's media stream WebSocket.
+   *
+   * In the Asterisk gateway architecture, media flows differently than the
+   * old direct Voicenter API. The gateway connects *to us* (the voice engine
+   * exposes a WebSocket), so this method is used when the voice engine needs
+   * to connect to a media stream URL provided by the gateway.
+   *
    * Audio flows bidirectionally:
-   * - Inbound: caller audio (PCM 16kHz) -> forwarded to Gemini
-   * - Outbound: Gemini audio (PCM 24kHz) -> sent to caller
+   * - Inbound: caller audio from Asterisk -> forwarded to AI model
+   * - Outbound: AI model audio -> sent to caller via Asterisk
    */
   connectMediaStream(
     mediaStreamUrl: string,
-    events: VoicenterMediaStreamEvents
+    events: SipGatewayMediaStreamEvents
   ): WebSocket {
-    this.log.info({ url: redactUrl(mediaStreamUrl) }, "Connecting to Voicenter media stream");
+    this.log.info({ url: redactUrl(mediaStreamUrl) }, "Connecting to SIP gateway media stream");
 
     const ws = new WebSocket(mediaStreamUrl);
     this.mediaWs = ws;
 
     ws.on("open", () => {
-      this.log.info("Voicenter media stream connected");
+      this.log.info("SIP gateway media stream connected");
     });
 
     ws.on("message", (data) => {
@@ -169,7 +186,7 @@ export class VoicenterClient {
         if (payload.event === "media" && payload.audio?.data) {
           events.onAudio(
             payload.audio.data,
-            payload.audio.mimeType || "audio/pcm;rate=16000"
+            payload.audio.mimeType || "audio/pcm;rate=8000;codec=ulaw"
           );
           return;
         }
@@ -179,12 +196,12 @@ export class VoicenterClient {
           return;
         }
       } catch (err) {
-        this.log.error({ err }, "Error parsing Voicenter media stream message");
+        this.log.error({ err }, "Error parsing SIP gateway media stream message");
       }
     });
 
     ws.on("error", (error) => {
-      this.log.error({ error }, "Voicenter media stream error");
+      this.log.error({ error }, "SIP gateway media stream error");
       events.onError(error);
     });
 
@@ -192,7 +209,7 @@ export class VoicenterClient {
       const reasonStr = Buffer.isBuffer(reason) ? reason.toString() : String(reason);
       this.log.info(
         { code, reason: reasonStr },
-        "Voicenter media stream closed"
+        "SIP gateway media stream closed"
       );
       if (code !== 1000) {
         events.onCallEnded(`media_stream_closed_${code}`);
@@ -221,22 +238,23 @@ export class VoicenterClient {
   }
 
   /**
-   * Hang up the call via Voicenter API.
+   * Hang up the call via the SIP gateway API.
    */
   async hangup(): Promise<void> {
-    if (!this.callId) return;
+    if (!this.sipCallId) return;
 
     try {
-      await fetch(`${this.baseUrl}/api/v1/calls/${this.callId}/hangup`, {
-        method: "POST",
+      await fetch(`${this.gatewayBaseUrl}/calls/${this.sipCallId}`, {
+        method: "DELETE",
         headers: {
-          Authorization: `Bearer ${this.credentials.apiKey}`,
-          "X-Account-Id": this.credentials.accountId,
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.sipGatewayApiKey}`,
         },
+        body: JSON.stringify({ reason: "voice_engine_hangup" }),
       });
-      this.log.info({ voicenterCallId: this.callId }, "Voicenter call hung up");
+      this.log.info({ sipCallId: this.sipCallId }, "SIP gateway call hung up");
     } catch (err) {
-      this.log.error({ err, voicenterCallId: this.callId }, "Failed to hang up Voicenter call");
+      this.log.error({ err, sipCallId: this.sipCallId }, "Failed to hang up SIP gateway call");
     }
   }
 
@@ -248,26 +266,42 @@ export class VoicenterClient {
       this.mediaWs.close();
     }
     this.mediaWs = null;
-    this.callId = null;
+    this.sipCallId = null;
   }
 }
 
 // ─── Credential Helper ──────────────────────────────────────────────
 
 /**
- * Parse decrypted Voicenter credentials from the tenant's encrypted column.
+ * Parse SIP gateway credentials from the tenant's configuration.
+ * The gateway uses a shared API key for authentication, while tenant-specific
+ * fields (callerId, tenantId) are passed per-call.
  */
-export function parseVoicenterCredentials(decryptedJson: string): VoicenterCredentials {
-  const parsed = JSON.parse(decryptedJson);
-  if (!parsed.apiKey || !parsed.callerId || !parsed.accountId) {
-    throw new Error("Invalid Voicenter credentials: missing apiKey, callerId, or accountId");
+export function parseSipGatewayCredentials(tenantConfig: {
+  callerId?: string;
+  tenantId: string;
+}): SipGatewayCredentials {
+  if (!tenantConfig.tenantId) {
+    throw new Error("Invalid SIP gateway credentials: missing tenantId");
   }
   return {
-    apiKey: parsed.apiKey,
-    callerId: parsed.callerId,
-    accountId: parsed.accountId,
-    mediaStreamUrl: parsed.mediaStreamUrl,
+    apiKey: config.sipGatewayApiKey,
+    callerId: tenantConfig.callerId || config.sipGatewayApiKey,
+    tenantId: tenantConfig.tenantId,
   };
+}
+
+// Keep the old interface name exported for backward compatibility
+export type VoicenterCredentials = SipGatewayCredentials;
+export type VoicenterMediaStreamEvents = SipGatewayMediaStreamEvents;
+
+/** @deprecated Use parseSipGatewayCredentials instead */
+export function parseVoicenterCredentials(decryptedJson: string): SipGatewayCredentials {
+  const parsed = JSON.parse(decryptedJson);
+  return parseSipGatewayCredentials({
+    callerId: parsed.callerId,
+    tenantId: parsed.tenantId || parsed.accountId,
+  });
 }
 
 // ─── Utilities ──────────────────────────────────────────────────────

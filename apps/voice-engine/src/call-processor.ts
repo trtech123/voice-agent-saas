@@ -336,24 +336,34 @@ export async function processCallJob(
   // -- Step 5: Initiate outbound call --
   const voicenterClient = new VoicenterClient(voicenterCreds, jobLog);
 
-  const callResult = await voicenterClient.initiateCall(contact.phone, callId);
-  if (!callResult.success || !callResult.mediaStreamUrl) {
+  // Build webhook/media URLs for the SIP gateway callback
+  const voiceEngineBaseUrl = config.sipGatewayBaseUrl
+    ? `http://localhost:${config.port}` // In production, use the Railway public URL
+    : `http://localhost:${config.port}`;
+  const eventWebhookUrl = `${voiceEngineBaseUrl}/api/v1/sip-events`;
+  const mediaStreamUrl = `ws://localhost:${config.port}/api/v1/media-stream`;
+
+  const callResult = await voicenterClient.initiateCall(contact.phone, callId, {
+    eventWebhookUrl,
+    mediaStreamUrl,
+  });
+  if (!callResult.success) {
     jobLog.error(
       { error: callResult.error },
-      "Voicenter call initiation failed"
+      "SIP gateway call initiation failed"
     );
     await callDal.update(callId, {
       status: "failed",
-      failure_reason: callResult.error ?? "voicenter_initiation_failed",
+      failure_reason: callResult.error ?? "sip_gateway_initiation_failed",
       ended_at: new Date().toISOString(),
     });
     await campaignContactDal.updateStatus(campaignContactId, "failed");
     return;
   }
 
-  // Update call with Voicenter ID
+  // Update call with SIP gateway call ID
   await callDal.update(callId, {
-    voicenter_call_id: callResult.voicenterCallId,
+    voicenter_call_id: callResult.sipCallId,
     status: "ringing",
   });
 
@@ -419,7 +429,7 @@ export async function processCallJob(
 
   // Connect Voicenter media stream to bridge
   const mediaEvents = bridge.getMediaEvents();
-  voicenterClient.connectMediaStream(callResult.mediaStreamUrl, mediaEvents);
+  voicenterClient.connectMediaStream(callResult.mediaStreamUrl ?? mediaStreamUrl, mediaEvents);
 
   // Update call status to connected
   await callDal.update(callId, { status: "connected" });

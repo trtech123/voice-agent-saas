@@ -9,8 +9,13 @@ export const config = {
   redisUrl: process.env.REDIS_URL ?? "redis://localhost:6379",
   geminiApiKey: process.env.GEMINI_API_KEY!,
   geminiModel: process.env.GEMINI_LIVE_MODEL ?? "models/gemini-2.5-flash-live-preview",
-  voicenterApiUrl: process.env.VOICENTER_API_URL!,
-  voicenterApiKey: process.env.VOICENTER_API_KEY!,
+  voicenterApiUrl: process.env.VOICENTER_API_URL ?? "",
+  voicenterApiKey: process.env.VOICENTER_API_KEY ?? "",
+
+  // SIP Gateway (Asterisk) — replaces direct Voicenter REST API
+  sipGatewayBaseUrl: process.env.SIP_GATEWAY_BASE_URL ?? "http://188.166.166.234:8091",
+  sipGatewayApiKey: process.env.SIP_GATEWAY_API_KEY ?? "",
+  sipGatewayEventsSecret: process.env.SIP_GATEWAY_EVENTS_SECRET ?? "",
   whatsappAccessToken: process.env.WHATSAPP_ACCESS_TOKEN!,
   whatsappPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID!,
   callHardTimeoutMs: Number(process.env.CALL_HARD_TIMEOUT_MS ?? 300_000), // 5 minutes
