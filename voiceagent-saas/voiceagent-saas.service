@@ -1,0 +1,21 @@
+# voiceagent-saas/voiceagent-saas.service
+[Unit]
+Description=Voice Agent SaaS - Merged Gateway + Voice Engine
+After=network.target asterisk.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/voiceagent-saas
+ExecStart=/usr/local/bin/node server.js
+Restart=always
+RestartSec=2
+WatchdogSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voiceagent-saas
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
