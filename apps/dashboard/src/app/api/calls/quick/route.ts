@@ -70,14 +70,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Create campaign_contact entry
+    // Upsert campaign_contact entry (may already exist from previous calls)
     const { data: cc, error: ccError } = await supabase
       .from("campaign_contacts")
-      .insert({
-        campaign_id: campaign.id,
-        contact_id: contact.id,
-        tenant_id: tenantId,
-      })
+      .upsert(
+        {
+          campaign_id: campaign.id,
+          contact_id: contact.id,
+          tenant_id: tenantId,
+          status: "pending",
+        },
+        { onConflict: "tenant_id,contact_id,campaign_id" }
+      )
       .select("id")
       .single();
 
