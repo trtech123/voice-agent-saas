@@ -2,6 +2,7 @@ import { createClient } from "@/lib/supabase-server";
 import { redirect } from "next/navigation";
 import { formatNumber } from "@/lib/utils/format";
 import { DashboardClient } from "./dashboard-client";
+import { QuickCallCard } from "@/components/quick-call-card";
 import {
   Phone,
   Megaphone,
@@ -153,6 +154,11 @@ export default async function DashboardPage() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* Quick Call card */}
+      <div className="mb-6">
+        <QuickCallCard />
       </div>
 
       {/* Main content: live feed + hot leads + chart */}

@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { Phone } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabList, TabTrigger, TabContent } from "@/components/ui/tabs";
 import { TabStatistics } from "@/components/campaign-detail/tab-statistics";
@@ -9,6 +10,7 @@ import { TabContacts } from "@/components/campaign-detail/tab-contacts";
 import { TabTranscripts } from "@/components/campaign-detail/tab-transcripts";
 import { TabFailed } from "@/components/campaign-detail/tab-failed";
 import { TabSettings } from "@/components/campaign-detail/tab-settings";
+import { QuickCallModal } from "@/components/quick-call-modal";
 import { campaignStatusLabels } from "@/lib/utils/format";
 import type { Campaign, CampaignContact, Contact, Call, CallTranscript } from "@vam/database";
 
@@ -50,6 +52,7 @@ export function CampaignDetailClient({
   transcripts,
 }: CampaignDetailClientProps) {
   const [campaign, setCampaign] = useState(initialCampaign);
+  const [quickCallOpen, setQuickCallOpen] = useState(false);
 
   return (
     <div>
@@ -68,7 +71,21 @@ export function CampaignDetailClient({
             label={campaignStatusLabels[campaign.status]}
           />
         </div>
+        <button
+          onClick={() => setQuickCallOpen(true)}
+          className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-white text-sm transition-all duration-200 cursor-pointer bg-[#10B981] hover:bg-[#059669] active:scale-[0.98] shadow-md hover:shadow-lg"
+        >
+          <Phone className="w-4 h-4" />
+          <span>התקשר עכשיו</span>
+        </button>
       </div>
+
+      <QuickCallModal
+        open={quickCallOpen}
+        onClose={() => setQuickCallOpen(false)}
+        campaignId={campaign.id}
+        campaignName={campaign.name}
+      />
 
       {/* Tabs */}
       <Tabs defaultTab="statistics">
