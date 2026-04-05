@@ -497,6 +497,8 @@ async function initiateCall(phoneNumber, callId) {
   callsBySipId.set(sipCallId, call);
   callIndexByCallId.set(callId, sipCallId);
   attachChannel(call, mediaChannelId, "media");
+  // Pre-register the customer channel so StasisStart can find the call
+  channelToCall.set(customerChannelId, sipCallId);
 
   try {
     await ariRequest("POST", `/bridges/${bridgeId}`, {

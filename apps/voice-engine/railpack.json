@@ -1,0 +1,8 @@
+{
+  "build": {
+    "command": "cd ../.. && npm install && npx tsc --project packages/database/tsconfig.json && npx tsc --project apps/voice-engine/tsconfig.json"
+  },
+  "start": {
+    "command": "node apps/voice-engine/dist/index.js"
+  }
+}

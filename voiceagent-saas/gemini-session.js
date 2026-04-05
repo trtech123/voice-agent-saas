@@ -15,17 +15,55 @@
  */
 
 import WebSocket from "ws";
+import { GoogleAuth } from "google-auth-library";
 import { buildToolDefinitions } from "./tools.js";
 
 // ─── Constants ──────────────────────────────────────────────────────
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID;
+const GCP_LOCATION = process.env.GCP_LOCATION || "europe-west1";
+const USE_VERTEX_AI = process.env.USE_VERTEX_AI === "true";
 
-const GEMINI_WS_URL =
+// Vertex AI EU endpoint (low latency for EU-based servers)
+const VERTEX_AI_WS_URL =
+  `wss://${GCP_LOCATION}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent`;
+
+// Google AI Studio endpoint (fallback)
+const AI_STUDIO_WS_URL =
   `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.` +
   `GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
-const GEMINI_MODEL = process.env.GEMINI_LIVE_MODEL || "models/gemini-3.1-flash-live-preview";
+const GEMINI_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
+
+// Google Auth client for Vertex AI OAuth tokens
+let authClient = null;
+if (USE_VERTEX_AI && process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  authClient = new GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+  });
+}
+
+async function getGeminiWsUrl() {
+  if (!USE_VERTEX_AI) {
+    return AI_STUDIO_WS_URL;
+  }
+  // Get OAuth token for Vertex AI
+  const client = await authClient.getClient();
+  const tokenResponse = await client.getAccessToken();
+  const token = tokenResponse.token;
+  // Vertex AI: model goes in setup payload, token in URL query
+  return `${VERTEX_AI_WS_URL}?access_token=${token}`;
+}
+
+/** Build the full model resource name for Vertex AI setup payload */
+function getModelForSetup() {
+  if (USE_VERTEX_AI) {
+    return `projects/${GCP_PROJECT_ID}/locations/${GCP_LOCATION}/publishers/google/models/${GEMINI_MODEL}`;
+  }
+  // Google AI Studio uses simple model names with "models/" prefix
+  return GEMINI_MODEL.startsWith("models/") ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
+}
 
 /** Maximum number of Gemini session reconnects per call before giving up. */
 export const MAX_GEMINI_RECONNECTS = 2;
@@ -64,7 +102,7 @@ export class GeminiSession {
   buildSetupPayload() {
     return {
       setup: {
-        model: GEMINI_MODEL,
+        model: getModelForSetup(),
         generationConfig: {
           responseModalities: ["AUDIO"],
           speechConfig: {
@@ -97,15 +135,16 @@ export class GeminiSession {
   /**
    * Open a new Gemini Live WebSocket connection.
    */
-  connect() {
+  async connect() {
     this._isReady = false;
-    const ws = new WebSocket(GEMINI_WS_URL);
+    const wsUrl = await getGeminiWsUrl();
+    const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.on("open", () => {
       this.log.info(
         {
-          model: GEMINI_MODEL,
+          model: getModelForSetup(),
           toolsEnabled: GEMINI_LIVE_INCLUDE_TOOLS,
         },
         "Sending Gemini Live setup"
@@ -135,7 +174,7 @@ export class GeminiSession {
    * Tear down current session and open a fresh one for reconnection.
    * Preserves conversation history via clientContent injection.
    */
-  reconnect(conversationHistory, lastToolResponsePayload, reconnectInstruction) {
+  async reconnect(conversationHistory, lastToolResponsePayload, reconnectInstruction) {
     this._isReady = false;
 
     // Close old WebSocket
@@ -153,8 +192,9 @@ export class GeminiSession {
       }
     }
 
-    // Open fresh connection
-    const ws = new WebSocket(GEMINI_WS_URL);
+    // Open fresh connection (with fresh OAuth token for Vertex AI)
+    const wsUrl = await getGeminiWsUrl();
+    const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.on("open", () => {

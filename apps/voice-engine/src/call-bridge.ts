@@ -25,7 +25,7 @@ import WebSocket from "ws";
 import { GeminiSession, MAX_GEMINI_RECONNECTS, type TranscriptPart } from "./gemini-session.js";
 import { VoicenterClient, type VoicenterMediaStreamEvents } from "./voicenter-client.js";
 import { executeToolCall, type ToolExecutionContext, type ToolResult } from "./tools.js";
-import { computeRmsBase64, createSilenceBuffer, SPEECH_RMS_THRESHOLD } from "./audio-utils.js";
+import { computeRmsBase64, createSilenceBuffer, SPEECH_RMS_THRESHOLD, ulawToGeminiPcm, geminiPcmToUlaw } from "./audio-utils.js";
 import {
   buildSystemPrompt,
   buildGreetingInstruction,
@@ -271,8 +271,11 @@ export class CallBridge {
 
     this.inboundAudioChunkCount += 1;
 
-    // RMS-based speech detection for watchdog
-    const rms = computeRmsBase64(audioBase64);
+    // Transcode ulaw 8kHz → PCM16 16kHz for Gemini
+    const pcmBase64 = ulawToGeminiPcm(audioBase64);
+
+    // RMS-based speech detection for watchdog (use PCM version for accuracy)
+    const rms = computeRmsBase64(pcmBase64);
     if (rms >= SPEECH_RMS_THRESHOLD) {
       const elapsed = this.lastSpeechChunkAt > 0
         ? Math.min(now - this.lastSpeechChunkAt, 30)
@@ -291,8 +294,8 @@ export class CallBridge {
       }
     }
 
-    // Forward to Gemini
-    this.gemini.sendAudio(audioBase64, "audio/pcm;rate=16000");
+    // Forward transcoded audio to Gemini
+    this.gemini.sendAudio(pcmBase64, "audio/pcm;rate=16000");
   }
 
   // ─── Gemini -> Bridge Handlers ─────────────────────────────────────
@@ -326,8 +329,9 @@ export class CallBridge {
     // Store for recording
     this.recordingChunks.push(Buffer.from(audioBase64, "base64"));
 
-    // Forward to Voicenter (caller hears agent)
-    this.cfg.voicenterClient.sendAudio(audioBase64, mimeType);
+    // Transcode Gemini PCM16 24kHz → ulaw 8kHz for Asterisk
+    const ulawBase64 = geminiPcmToUlaw(audioBase64);
+    this.cfg.voicenterClient.sendAudio(ulawBase64, "audio/x-mulaw;rate=8000");
   }
 
   private handleInputTranscription(text: string): void {

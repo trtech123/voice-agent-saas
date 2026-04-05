@@ -1,0 +1,10 @@
+{
+  "steps": {
+    "build": {
+      "commands": ["npm install", "npm run build --workspace=@vam/database", "npm run build --workspace=@vam/dashboard"]
+    }
+  },
+  "deploy": {
+    "startCommand": "npm run start --workspace=@vam/dashboard"
+  }
+}

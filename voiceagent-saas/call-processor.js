@@ -25,7 +25,7 @@ import { Worker, Queue } from "bullmq";
 import { createClient } from "@supabase/supabase-js";
 import { createWriteStream, mkdirSync, existsSync, unlinkSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CallBridge } from "./call-bridge.js";
+import { CallBridge, preRegisterBridge } from "./call-bridge.js";
 import { ComplianceGate, DncEnforcer, isWithinScheduleWindows } from "./compliance.js";
 import { executeToolCall, buildToolDefinitions } from "./tools.js";
 import { WhatsAppClient } from "./whatsapp-client.js";
@@ -75,7 +75,7 @@ class TenantDAL {
 
   async isUnderCallLimit() {
     const tenant = await this.get();
-    return tenant.calls_used < tenant.calls_limit;
+    return tenant.calls_used_this_month < tenant.calls_limit;
   }
 
   async incrementCallsUsed() {
@@ -85,10 +85,10 @@ class TenantDAL {
     if (error) {
       // Fallback: manual increment
       const tenant = await this.get();
-      const newCount = (tenant.calls_used || 0) + 1;
+      const newCount = (tenant.calls_used_this_month || 0) + 1;
       await this.db
         .from("tenants")
-        .update({ calls_used: newCount })
+        .update({ calls_used_this_month: newCount })
         .eq("id", this.tenantId);
       return newCount;
     }
@@ -430,9 +430,7 @@ async function processCallJob(job, config) {
     campaignId,
   });
 
-  // -- Step 4: Initiate outbound call via gateway API (in-process) --
-  // The gateway IS this process. gatewayApi.initiateCall() triggers
-  // Asterisk ARI to dial out through the Voicenter trunk.
+  // -- Step 4: Verify gateway API is available --
   const gatewayApi = config.gatewayApi;
   if (!gatewayApi || typeof gatewayApi.initiateCall !== "function") {
     log.error("No gatewayApi.initiateCall provided — cannot initiate call");
@@ -444,34 +442,6 @@ async function processCallJob(job, config) {
     await campaignContactDal.updateStatus(campaignContactId, "failed");
     return;
   }
-
-  let callInitResult;
-  try {
-    callInitResult = await gatewayApi.initiateCall(contact.phone, callId);
-  } catch (err) {
-    log.error({ err }, "Gateway call initiation failed");
-    await callDal.update(callId, {
-      status: "failed",
-      failure_reason: err instanceof Error ? err.message : "gateway_initiation_failed",
-      ended_at: new Date().toISOString(),
-    });
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
-    return;
-  }
-
-  if (callInitResult && !callInitResult.success) {
-    log.error({ error: callInitResult.error }, "Gateway call initiation returned failure");
-    await callDal.update(callId, {
-      status: "failed",
-      failure_reason: callInitResult.error ?? "gateway_initiation_failed",
-      ended_at: new Date().toISOString(),
-    });
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
-    return;
-  }
-
-  // Update call status to ringing
-  await callDal.update(callId, { status: "ringing" });
 
   // -- Step 5: Set up recording writer --
   const recording = createRecordingWriter(callId);
@@ -552,7 +522,39 @@ async function processCallJob(job, config) {
     log,
   });
 
-  // Update call status to connected
+  // Pre-register bridge BEFORE initiating Asterisk call.
+  // This ensures media-bridge can find the bridge when ExternalMedia connects.
+  preRegisterBridge(callId, bridge);
+
+  // -- Step 9b: Initiate outbound call via gateway API --
+  let callInitResult;
+  try {
+    callInitResult = await gatewayApi.initiateCall(contact.phone, callId);
+  } catch (err) {
+    log.error({ err }, "Gateway call initiation failed");
+    await callDal.update(callId, {
+      status: "failed",
+      failure_reason: err instanceof Error ? err.message : "gateway_initiation_failed",
+      ended_at: new Date().toISOString(),
+    });
+    await campaignContactDal.updateStatus(campaignContactId, "failed");
+    bridge.cleanup();
+    return;
+  }
+
+  if (callInitResult && !callInitResult.success) {
+    log.error({ error: callInitResult.error }, "Gateway call initiation returned failure");
+    await callDal.update(callId, {
+      status: "failed",
+      failure_reason: callInitResult.error ?? "gateway_initiation_failed",
+      ended_at: new Date().toISOString(),
+    });
+    await campaignContactDal.updateStatus(campaignContactId, "failed");
+    bridge.cleanup();
+    return;
+  }
+
+  // Update call status to ringing/connected
   await callDal.update(callId, { status: "connected" });
 
   // Wait for bridge to complete (call ends)

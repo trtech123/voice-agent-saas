@@ -65,6 +65,14 @@ export function getActiveBridge(callId) {
   return activeBridges.get(callId);
 }
 
+/**
+ * Pre-register a CallBridge instance BEFORE initiating the Asterisk call.
+ * This ensures media-bridge can find the bridge when ExternalMedia connects.
+ */
+export function preRegisterBridge(callId, bridge) {
+  activeBridges.set(callId, bridge);
+}
+
 export function cleanupAllBridges() {
   for (const [callId, bridge] of activeBridges) {
     bridge.endBridge("server_shutdown");

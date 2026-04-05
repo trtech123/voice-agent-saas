@@ -14,7 +14,19 @@
  * Green API docs: https://green-api.com/docs/
  */
 
-import { decryptCredential } from "@vam/database";
+import { createDecipheriv } from "node:crypto";
+
+function decryptCredential(encrypted, kekBase64) {
+  const kek = Buffer.from(kekBase64, "base64");
+  if (kek.length !== 32) throw new Error("KEK must be 32 bytes");
+  const { ciphertext, iv, tag, dek: dekEncrypted, dekIv, dekTag } = JSON.parse(encrypted);
+  const dekDecipher = createDecipheriv("aes-256-gcm", kek, Buffer.from(dekIv, "base64"));
+  dekDecipher.setAuthTag(Buffer.from(dekTag, "base64"));
+  const dek = Buffer.concat([dekDecipher.update(Buffer.from(dekEncrypted, "base64")), dekDecipher.final()]);
+  const payloadDecipher = createDecipheriv("aes-256-gcm", dek, Buffer.from(iv, "base64"));
+  payloadDecipher.setAuthTag(Buffer.from(tag, "base64"));
+  return Buffer.concat([payloadDecipher.update(Buffer.from(ciphertext, "base64")), payloadDecipher.final()]).toString("utf8");
+}
 
 const GREEN_API_BASE_URL = "https://api.green-api.com";
 

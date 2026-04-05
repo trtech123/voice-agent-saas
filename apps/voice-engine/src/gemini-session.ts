@@ -107,7 +107,7 @@ export class GeminiSession {
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
-                voiceName: this.sessionConfig.voiceName || "Sulafat",
+                voiceName: this.sessionConfig.voiceName || process.env.GEMINI_VOICE_NAME || "Aoede",
               },
             },
           },

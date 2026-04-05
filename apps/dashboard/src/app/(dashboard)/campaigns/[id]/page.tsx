@@ -76,7 +76,7 @@ export default async function CampaignDetailPage({ params }: Props) {
     .eq("campaign_id", campaignId)
     .eq("tenant_id", tenantId);
 
-  const callIdList = (callIds ?? []).map((c) => c.id);
+  const callIdList = (callIds ?? []).map((c: any) => c.id);
 
   let transcriptRows: any[] = [];
   if (callIdList.length > 0) {

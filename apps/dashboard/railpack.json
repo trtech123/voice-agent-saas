@@ -1,0 +1,8 @@
+{
+  "build": {
+    "command": "cd ../.. && npm install && cd apps/dashboard && npx next build"
+  },
+  "start": {
+    "command": "cd ../.. && npm run start --workspace=@vam/dashboard"
+  }
+}

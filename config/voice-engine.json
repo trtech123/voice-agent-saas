@@ -1,0 +1,10 @@
+{
+  "steps": {
+    "build": {
+      "commands": ["npm install", "npx tsc -p packages/database/tsconfig.json", "npx tsc -p apps/voice-engine/tsconfig.json"]
+    }
+  },
+  "deploy": {
+    "startCommand": "node apps/voice-engine/dist/index.js"
+  }
+}

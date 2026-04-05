@@ -90,8 +90,14 @@ function validateVoicenterConfig() {
 }
 
 function normalizePhoneNumber(phoneNumber) {
-  const digits = String(phoneNumber || "").replace(/[^\d]/g, "");
-  return digits ? `+${digits}` : "";
+  let digits = String(phoneNumber || "").replace(/[^\d+]/g, "");
+  // Strip leading + if present
+  digits = digits.replace(/^\+/, "");
+  // Convert international Israeli format (972...) to local (0...)
+  if (digits.startsWith("972") && digits.length >= 12) {
+    digits = "0" + digits.slice(3);
+  }
+  return digits || "";
 }
 
 function buildVoicenterDialTarget(phoneNumber) {
@@ -100,11 +106,10 @@ function buildVoicenterDialTarget(phoneNumber) {
     throw new Error("A valid target phone number is required");
   }
 
-  // For Voicenter SIP trunk: PJSIP/<endpoint>/<sip_uri>
-  // Using UDP transport to sip09.voicenter.co
-  const sipUri =
-    `sip:${normalizedNumber}@${VOICENTER_SIP_SERVER}` +
-    `;transport=${VOICENTER_TRANSPORT}`;
+  // For Voicenter SIP trunk: PJSIP/<endpoint>/sip:<number>@<server>
+  // Use IP 185.138.169.235 directly (DNS resolution issues with hostname)
+  const sipServer = "185.138.169.235";
+  const sipUri = `sip:${normalizedNumber}@${sipServer}`;
   return `PJSIP/${VOICENTER_PJSIP_ENDPOINT}/${sipUri}`;
 }
 
