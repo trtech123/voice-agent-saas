@@ -205,9 +205,9 @@ export async function stopLiveTurnWriter() {
  *   3. Otherwise: drain up to PER_CALL_DRAIN_MAX from each call.
  */
 async function flushAll() {
-  if (!sql || stopping && !running) {
-    // allow one final drain during stopping; the 'stopping && !running' guard
-    // is intentionally permissive — stopLiveTurnWriter() awaits flushAll() once.
+  if (!sql || (stopping && !running)) {
+    // writer is stopping or shut down; drop this flush attempt
+    return;
   }
   if (!sql) return;
   if (running) return; // serialize flushes
@@ -335,7 +335,7 @@ async function spillOldestToDisk(n) {
     remaining -= take;
   }
   if (lines.length === 0) return;
-  await fs.appendFile(fallbackPath, lines.join('\n') + '\n');
+  await _appendFile(fallbackPath, lines.join('\n') + '\n');
 }
 
 /**
@@ -351,7 +351,7 @@ async function appendRowsToDisk(rows) {
     is_final: t.is_final,
     ts: t.ts,
   }));
-  await fs.appendFile(fallbackPath, lines.join('\n') + '\n');
+  await _appendFile(fallbackPath, lines.join('\n') + '\n');
 }
 
 /**
@@ -366,25 +366,24 @@ function resolveFallbackPathSync() {
   return path.join(FALLBACK_DIR_PRIMARY, FALLBACK_FILENAME);
 }
 
-// One-shot probe: on the first appendFile failure, swap to ./logs and retry.
-const _origAppendFile = fs.appendFile.bind(fs);
-async function _appendWithFallback(file, data) {
+// Module-local appendFile with one-shot fallback: on the first appendFile
+// failure against the primary path, swap to ./logs and retry. This is
+// intentionally a local binding — we MUST NOT mutate fs.promises.appendFile
+// globally or we poison the built-in for every other module in the process.
+async function _appendFile(file, data) {
   try {
-    await _origAppendFile(file, data);
+    await fs.appendFile(file, data);
   } catch (err) {
     if (file === path.join(FALLBACK_DIR_PRIMARY, FALLBACK_FILENAME)) {
       const alt = path.join(FALLBACK_DIR_SECONDARY, FALLBACK_FILENAME);
       try { await fs.mkdir(FALLBACK_DIR_SECONDARY, { recursive: true }); } catch {}
       fallbackPath = alt;
-      await _origAppendFile(alt, data);
+      await fs.appendFile(alt, data);
     } else {
       throw err;
     }
   }
 }
-// Override the binding used above so the spill/append functions get the
-// fallback behavior transparently.
-fs.appendFile = _appendWithFallback;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));

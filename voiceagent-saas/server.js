@@ -20,11 +20,9 @@ import { ariRequest, ensureAriEventSocket, getAriStatus, subscribeToAriEvents } 
 import { registerGatewayMediaSocket } from "./media-bridge.js";
 import { createCallWorker, createMonthlyResetScheduler } from "./call-processor.js";
 import { getActiveBridgeCount, cleanupAllBridges } from "./call-bridge.js";
-import { Queue } from "bullmq";
 import { createClient } from "@supabase/supabase-js";
 import { startLiveTurnWriter, stopLiveTurnWriter } from "./live-turn-writer.js";
 import { startAgentSyncWorker, stopAgentSyncWorker } from "./agent-sync-processor.js";
-import { startAudioArchiveWorker, stopAudioArchiveWorker } from "./audio-archive-processor.js";
 import { startJanitor, stopJanitor } from "./janitor.js";
 
 // ─── Required env validation ──────────────────────────────────────
@@ -630,7 +628,6 @@ fastify.get("/health", async () => {
     mediaFormat: ASTERISK_MEDIA_FORMAT,
     liveTurnWriter: auxWorkersStarted ? "ok" : "not_started",
     agentSyncWorker: auxWorkersStarted ? "ok" : "not_started",
-    audioArchiveWorker: auxWorkersStarted ? "ok" : "not_started",
     janitor: auxWorkersStarted ? "ok" : "not_started",
   };
 });
@@ -731,18 +728,16 @@ const eventLoopMonitorInterval = setInterval(() => {
 let worker = null;
 let monthlyResetScheduler = null;
 let supabaseAdmin = null;
-let audioArchiveQueue = null;
 let auxWorkersStarted = false;
 
 // ─── Boot Ordering (LOAD-BEARING) ──────────────────────────────────
 // 1. live-turn-writer BEFORE the call worker — call-bridge calls
 //    enqueueTurn() as soon as a call starts; calling before init silently
 //    no-ops (started guard) and we'd lose transcripts.
-// 2. audio-archive worker BEFORE janitor — janitor re-enqueues into the
-//    audio-archive-jobs queue and the worker must exist to consume them.
-// 3. audioArchiveQueue (producer handle) created after the worker is
-//    listening — conceptually producer-side.
-// 4. call worker LAST so all sinks are ready before any job dispatches.
+// 2. agent-sync worker + janitor (aux).
+// 3. call worker LAST so all sinks are ready before any job dispatches.
+// Note: audio archival is handled synchronously in the dashboard webhook
+// handler (post_call_audio event); no worker or queue runs on the droplet.
 if (REDIS_URL) {
   supabaseAdmin = createClient(
     process.env.SUPABASE_URL,
@@ -761,33 +756,22 @@ if (REDIS_URL) {
     logger: fastify.log,
   });
 
-  // 3. audio-archive worker
-  startAudioArchiveWorker({
-    supabase: supabaseAdmin,
-    connection: bullConnection,
-    logger: fastify.log,
-  });
-
-  // 4. producer-side queue handle for the janitor
-  audioArchiveQueue = new Queue("audio-archive-jobs", { connection: bullConnection });
-
-  // 5. janitor
+  // 3. janitor
   startJanitor({
     supabase: supabaseAdmin,
-    audioArchiveQueue,
     logger: fastify.log,
   });
 
   auxWorkersStarted = true;
 
-  // 6. call worker (existing)
+  // 4. call worker (existing)
   worker = createCallWorker(5, {
     gatewayApi: { initiateCall, getCallState },
     log: fastify.log,
   });
 
   monthlyResetScheduler = createMonthlyResetScheduler();
-  fastify.log.info("BullMQ call worker, aux workers, and monthly reset scheduler started");
+  fastify.log.info("BullMQ call worker, agent-sync worker, janitor, and monthly reset scheduler started");
 } else {
   fastify.log.warn("REDIS_URL not set — BullMQ worker disabled (gateway-only mode)");
 }
@@ -837,18 +821,13 @@ async function shutdown(signal) {
   }
 
   // ─── Aux subsystem shutdown (LOAD-BEARING, reverse of boot) ──────
-  // a. agent-sync + audio-archive workers stop (drain their in-flight jobs)
+  // a. agent-sync worker stops (drain in-flight jobs)
   // b. janitor timer stops (no new sweeps)
-  // c. audioArchiveQueue producer handle closes
-  // d. live-turn-writer LAST — must run after all bridges had a chance to
+  // c. live-turn-writer LAST — must run after all bridges had a chance to
   //    flushAndClose(callId), otherwise final turns spill to disk.
   if (auxWorkersStarted) {
     try { await stopAgentSyncWorker(); } catch (err) { fastify.log.error({ err }, "stopAgentSyncWorker failed"); }
-    try { await stopAudioArchiveWorker(); } catch (err) { fastify.log.error({ err }, "stopAudioArchiveWorker failed"); }
     try { await stopJanitor(); } catch (err) { fastify.log.error({ err }, "stopJanitor failed"); }
-    if (audioArchiveQueue) {
-      try { await audioArchiveQueue.close(); } catch (err) { fastify.log.error({ err }, "audioArchiveQueue.close failed"); }
-    }
     try { await stopLiveTurnWriter(); } catch (err) { fastify.log.error({ err }, "stopLiveTurnWriter failed"); }
   }
 

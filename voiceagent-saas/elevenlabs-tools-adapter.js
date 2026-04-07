@@ -31,9 +31,12 @@ export function buildElevenLabsClientTools() {
   const gemini = buildToolDefinitions();
   const decls = (gemini && gemini.functionDeclarations) || [];
 
+  // All Spec A tools are side-effect-bearing → blocking (post_tool_speech).
   return decls.map((decl) => ({
-    tool_name: decl.name,
+    type: "client_tool",
+    name: decl.name,
     description: decl.description,
     parameters: decl.parameters,
+    execution_mode: "post_tool_speech",
   }));
 }

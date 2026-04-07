@@ -1,11 +1,16 @@
 // voiceagent-saas/janitor.js
 //
-// Janitor — periodic sweeps for stuck calls, orphaned audio-archive jobs,
-// and old webhook events. Part of Spec A (ElevenLabs runtime swap), task T8.
+// Janitor — periodic sweeps for stuck calls and old webhook events.
+// Part of Spec A (ElevenLabs runtime swap), task T8.
 //
 // Public interface:
-//   startJanitor({ supabase, audioArchiveQueue, logger })
+//   startJanitor({ supabase, logger })
 //   stopJanitor() -> Promise<void>
+//
+// Note: the orphaned audio-archive sweep has been removed. Audio archival
+// now runs synchronously in the dashboard webhook handler on the
+// `post_call_audio` ElevenLabs event, so there are no BullMQ jobs to
+// re-enqueue from here.
 //
 // The janitor runs every 60s. Each sweep is wrapped in its own try/catch
 // so a single failing sweep cannot block the others, and the top-level
@@ -25,7 +30,6 @@ let stopping = false;
 
 const SWEEP_INTERVAL_MS = 60_000;
 const STUCK_CALL_AGE_MINUTES = 15;
-const ORPHAN_ARCHIVE_AGE_MINUTES = 10;
 const WEBHOOK_EVENTS_TTL_DAYS = 30;
 const BATCH_LIMIT = 50;
 
@@ -135,73 +139,7 @@ async function sweepStuckCalls(supabase, log) {
   }
 }
 
-// ─── Sweep 2: Orphaned audio archives ─────────────────────────────
-//
-// Calls where the EL webhook landed (webhook_processed_at IS NOT NULL)
-// but audio_archive_status is still 'pending' after a 10-minute grace
-// window. The original BullMQ job was lost (e.g. worker crash before it
-// ran) — re-enqueue it.
-//
-// We do NOT flip audio_archive_status here; the T7 audio-archive
-// processor is the sole writer of 'archived' / 'failed'.
-
-async function sweepOrphanedArchives(supabase, audioArchiveQueue, log) {
-  if (!audioArchiveQueue) {
-    log.warn("sweepOrphanedArchives: no audioArchiveQueue provided, skipping");
-    return;
-  }
-
-  const cutoffIso = new Date(
-    Date.now() - ORPHAN_ARCHIVE_AGE_MINUTES * 60_000,
-  ).toISOString();
-
-  const { data: orphanRows, error: selectErr } = await supabase
-    .from("calls")
-    .select("id")
-    .eq("audio_archive_status", "pending")
-    .not("webhook_processed_at", "is", null)
-    .lt("webhook_processed_at", cutoffIso)
-    .order("webhook_processed_at", { ascending: true })
-    .limit(BATCH_LIMIT);
-
-  if (selectErr) {
-    log.error({ err: selectErr }, "sweepOrphanedArchives: select failed");
-    return;
-  }
-  if (!orphanRows || orphanRows.length === 0) return;
-
-  for (const row of orphanRows) {
-    try {
-      // BullMQ jobId dedup: if a job with this id already exists in the
-      // queue, .add() is a no-op — safe to call repeatedly per sweep.
-      //
-      // TODO: T7 audio-archive-processor must handle re-enqueued jobs
-      // that lack a signedUrl in payload — it should fetch the recording
-      // fresh from ElevenLabs via the stored elevenlabs_conversation_id.
-      await audioArchiveQueue.add(
-        "audio-archive",
-        { callId: row.id },
-        {
-          jobId: `audio:${row.id}`,
-          attempts: 5,
-          backoff: { type: "exponential", delay: 5000 },
-        },
-      );
-
-      log.warn(
-        { event: "janitor_reenqueued_audio_archive", call_id: row.id },
-        "janitor re-enqueued orphaned audio-archive job",
-      );
-    } catch (err) {
-      log.error(
-        { err, call_id: row?.id },
-        "sweepOrphanedArchives: unexpected per-row error",
-      );
-    }
-  }
-}
-
-// ─── Sweep 3: Webhook events cleanup ──────────────────────────────
+// ─── Sweep 2: Webhook events cleanup ──────────────────────────────
 //
 // Delete webhook_events older than 30 days. Forensic window is long
 // enough to investigate, short enough to keep the table bounded.
@@ -243,10 +181,9 @@ async function sweepOldWebhookEvents(supabase, log) {
  * Start the janitor. Idempotent — calling twice is a no-op.
  * @param {object} args
  * @param {object} args.supabase - Supabase service-role client
- * @param {object} args.audioArchiveQueue - BullMQ Queue for 'audio-archive-jobs'
  * @param {object} args.logger - pino-compatible logger (fastify.log)
  */
-export function startJanitor({ supabase, audioArchiveQueue, logger }) {
+export function startJanitor({ supabase, logger }) {
   if (timerHandle) return; // idempotent
 
   const log =
@@ -265,11 +202,6 @@ export function startJanitor({ supabase, audioArchiveQueue, logger }) {
         await sweepStuckCalls(supabase, log);
       } catch (err) {
         log.error({ err }, "sweepStuckCalls threw");
-      }
-      try {
-        await sweepOrphanedArchives(supabase, audioArchiveQueue, log);
-      } catch (err) {
-        log.error({ err }, "sweepOrphanedArchives threw");
       }
       try {
         await sweepOldWebhookEvents(supabase, log);

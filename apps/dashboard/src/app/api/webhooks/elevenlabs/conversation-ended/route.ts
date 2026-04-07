@@ -1,41 +1,39 @@
-// ElevenLabs conversation-ended webhook handler.
+// ElevenLabs post-call webhook handler.
 // Spec: docs/superpowers/specs/2026-04-07-elevenlabs-runtime-swap-design.md §4.6
 // Plan: docs/superpowers/plans/2026-04-07-elevenlabs-runtime-swap-plan.md (T9)
 //
-// Step ordering is LOAD-BEARING. Do not reorder without re-reading T9 acceptance criteria.
+// Ground truth from EL support (2026-04-07):
+//   Two distinct event types arrive at this endpoint, with NO guarantee of
+//   ordering between them:
+//     - post_call_transcription  — transcript, analysis, tool calls
+//     - post_call_audio          — base64-encoded MP3 of the full call
+//
+//   Header: `ElevenLabs-Signature: t=<unix_seconds>,v0=<hex_hmac_sha256>`
+//   Signed payload: `${t}.${rawBody}` — HMAC-SHA256 keyed by webhook secret.
+//   Skew window: 1800 seconds (30 minutes).
+//
+// Audio handling: synchronous upload to Supabase Storage. No BullMQ queue.
+// If the audio webhook arrives BEFORE the transcription webhook, we stage
+// the decoded MP3 at `call-recordings/pending/{conversation_id}.mp3`. When
+// the transcription handler later runs, it moves the staged file to the
+// final path `{tenant_id}/{call_id}.mp3`.
+// If the audio webhook is lost entirely, the audio is gone — EL has no
+// re-fetch endpoint. This is an accepted terminal failure.
 
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
-import { Queue } from "bullmq";
 import { createAdminClient } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
 
-// ---- Env (read at module top) ---------------------------------------------
+// ---- Env ------------------------------------------------------------------
 const WEBHOOK_SECRET = process.env.ELEVENLABS_WEBHOOK_SECRET;
-const REDIS_URL = process.env.REDIS_URL;
 
-const MAX_BODY_BYTES = 262144; // 256 KB — also enforced by webhook_events CHECK constraint
-const MAX_SKEW_SECONDS = 300; // 5 minutes
-
-// ---- Module-level BullMQ producer for audio-archive jobs ------------------
-// Singleton — never re-instantiate per request.
-let audioArchiveQueue: Queue | null = null;
-function getAudioArchiveQueue(): Queue | null {
-  if (!REDIS_URL) return null;
-  if (!audioArchiveQueue) {
-    audioArchiveQueue = new Queue("audio-archive-jobs", {
-      connection: { url: REDIS_URL },
-      defaultJobOptions: {
-        attempts: 5,
-        backoff: { type: "exponential", delay: 5000 },
-        removeOnComplete: { count: 1000 },
-        removeOnFail: { count: 5000 },
-      },
-    });
-  }
-  return audioArchiveQueue;
-}
+// Allow a larger body because post_call_audio carries base64 MP3.
+// ~50 MB MP3 → ~67 MB base64 → leave generous headroom.
+const MAX_BODY_BYTES = 80 * 1024 * 1024; // 80 MB
+const MAX_SKEW_SECONDS = 1800; // 30 minutes — per EL support
+const STORAGE_BUCKET = "call-recordings";
 
 // ---- Response helpers ------------------------------------------------------
 function errorResponse(status: number, code: string, message: string) {
@@ -45,7 +43,11 @@ function errorResponse(status: number, code: string, message: string) {
   );
 }
 
-function logEvent(level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>) {
+function logEvent(
+  level: "info" | "warn" | "error",
+  msg: string,
+  extra?: Record<string, unknown>
+) {
   const line = JSON.stringify({
     level,
     msg,
@@ -58,24 +60,25 @@ function logEvent(level: "info" | "warn" | "error", msg: string, extra?: Record<
   else console.log(line);
 }
 
-// ---- Signature parsing/verification ---------------------------------------
-// EL signing follows the Stripe-style convention: sign `${timestamp}.${rawBody}`
-// with HMAC-SHA256 keyed by the webhook secret. The `elevenlabs-signature`
-// header may arrive as either:
-//   - raw hex digest, OR
-//   - `t=<unix>,v0=<hex>` comma-separated key=value pairs.
-// We accept both shapes.
-function extractSignatureHex(headerVal: string): string | null {
+// ---- Signature verification ------------------------------------------------
+// Header format: `t=<unix_seconds>,v0=<hex_hmac_sha256>`
+function parseSignatureHeader(
+  headerVal: string
+): { ts: number; hex: string } | null {
   if (!headerVal) return null;
-  if (headerVal.includes("=")) {
-    const parts = headerVal.split(",").map((p) => p.trim());
-    for (const p of parts) {
-      const [k, v] = p.split("=");
-      if (k === "v0" && v) return v;
-    }
-    return null;
+  const parts = headerVal.split(",").map((p) => p.trim());
+  let ts: number | null = null;
+  let hex: string | null = null;
+  for (const p of parts) {
+    const eq = p.indexOf("=");
+    if (eq < 0) continue;
+    const k = p.slice(0, eq);
+    const v = p.slice(eq + 1);
+    if (k === "t") ts = Number(v);
+    else if (k === "v0") hex = v;
   }
-  return headerVal.trim();
+  if (ts === null || !Number.isFinite(ts) || !hex) return null;
+  return { ts, hex };
 }
 
 function timingSafeEqualHex(aHex: string, bHex: string): boolean {
@@ -88,61 +91,92 @@ function timingSafeEqualHex(aHex: string, bHex: string): boolean {
   }
 }
 
-// ---- Field extraction (defensive — EL post-call payload schema is not
-// pinned in Appendix A; Appendix A only covers the live WS protocol).
-// TODO: pin against EL post-call webhook docs once available.
-function pick<T = unknown>(obj: any, paths: string[]): T | undefined {
-  for (const path of paths) {
-    const parts = path.split(".");
-    let cur = obj;
-    let ok = true;
-    for (const p of parts) {
-      if (cur && typeof cur === "object" && p in cur) cur = cur[p];
-      else {
-        ok = false;
-        break;
-      }
-    }
-    if (ok && cur !== undefined && cur !== null) return cur as T;
-  }
-  return undefined;
+// ---- Storage helpers -------------------------------------------------------
+function pendingPath(conversationId: string): string {
+  return `pending/${conversationId}.mp3`;
+}
+function finalPath(tenantId: string, callId: string): string {
+  return `${tenantId}/${callId}.mp3`;
 }
 
-// ---- Handler --------------------------------------------------------------
+async function uploadAudio(
+  supabase: ReturnType<typeof createAdminClient>,
+  path: string,
+  buffer: Buffer
+) {
+  return await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(path, buffer, {
+      contentType: "audio/mpeg",
+      upsert: true,
+    });
+}
+
+// Download, upload to final, then delete pending. If the final upload fails,
+// we leave the pending file in place so a later retry can recover it.
+// TODO: confirm Supabase Storage has no atomic "move" primitive and this
+// download+upload+delete dance is the canonical approach.
+async function movePendingToFinal(
+  supabase: ReturnType<typeof createAdminClient>,
+  conversationId: string,
+  tenantId: string,
+  callId: string,
+  log: (lvl: "info" | "warn" | "error", msg: string, extra?: any) => void
+): Promise<string | null> {
+  const src = pendingPath(conversationId);
+  const dst = finalPath(tenantId, callId);
+
+  const { data: dl, error: dlErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .download(src);
+  if (dlErr || !dl) {
+    // Not staged — normal case: audio webhook has not arrived yet.
+    return null;
+  }
+  const arrayBuffer = await dl.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  const { error: upErr } = await uploadAudio(supabase, dst, buffer);
+  if (upErr) {
+    log("error", "move pending→final upload failed", { err: upErr.message, dst });
+    return null;
+  }
+
+  const { error: rmErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .remove([src]);
+  if (rmErr) {
+    // Non-fatal — the real file is in place. Orphan cleanup left to a
+    // future janitor sweep of pending/ > 24h.
+    log("warn", "pending cleanup failed (non-fatal)", { err: rmErr.message, src });
+  }
+  return dst;
+}
+
+// ---- Handler ---------------------------------------------------------------
 export async function POST(req: NextRequest) {
   try {
-    // ===== Step 0: pre-checks (NO DB writes yet) =====
+    // ===== Step 0: size + headers =====
     const contentLengthHeader = req.headers.get("content-length");
     if (contentLengthHeader && Number(contentLengthHeader) > MAX_BODY_BYTES) {
       logEvent("warn", "rejected oversize payload (content-length)", {
         contentLength: contentLengthHeader,
       });
-      return errorResponse(413, "PAYLOAD_TOO_LARGE", "payload exceeds 256 KB");
+      return errorResponse(413, "PAYLOAD_TOO_LARGE", "payload too large");
     }
 
-    // Canonical timestamp header is `elevenlabs-signature-timestamp`; fall back to `x-elevenlabs-timestamp`.
-    const timestampHeader =
-      req.headers.get("elevenlabs-signature-timestamp") ??
-      req.headers.get("x-elevenlabs-timestamp");
-    if (!timestampHeader) {
-      logEvent("warn", "missing timestamp header");
-      return errorResponse(400, "MISSING_TIMESTAMP", "missing timestamp header");
-    }
-
-    // Read raw body as text (needed for HMAC + JSON.parse).
     const rawBody = await req.text();
     if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
       logEvent("warn", "rejected oversize payload (post-read)", {
         bytes: Buffer.byteLength(rawBody, "utf8"),
       });
-      return errorResponse(413, "PAYLOAD_TOO_LARGE", "payload exceeds 256 KB");
+      return errorResponse(413, "PAYLOAD_TOO_LARGE", "payload too large");
     }
 
+    // Next.js normalizes incoming header names to lowercase.
     const signatureHeader = req.headers.get("elevenlabs-signature") ?? "";
     const contentTypeHeader = req.headers.get("content-type") ?? "";
 
-    // ===== Step 1: forensic insert into webhook_events BEFORE verification =====
-    // If the body isn't valid JSON, return 400 (raw_body column is jsonb).
     let parsedBody: any;
     try {
       parsedBody = JSON.parse(rawBody);
@@ -153,6 +187,24 @@ export async function POST(req: NextRequest) {
 
     const supabase = createAdminClient();
 
+    // ===== Step 1: forensic webhook_events insert (best-effort) =====
+    // Note: post_call_audio bodies can be very large (MBs of base64) and the
+    // webhook_events.raw_body CHECK constraint caps them at 256 KB. We only
+    // persist the raw body when it fits; otherwise we store a metadata stub.
+    const bodyBytes = Buffer.byteLength(rawBody, "utf8");
+    const weRawBody =
+      bodyBytes <= 250_000
+        ? parsedBody
+        : {
+            _truncated: true,
+            type: parsedBody?.type ?? null,
+            event_timestamp: parsedBody?.event_timestamp ?? null,
+            data: {
+              conversation_id: parsedBody?.data?.conversation_id ?? null,
+            },
+            _size: bodyBytes,
+          };
+
     let webhookEventId: string | null = null;
     try {
       const { data: weRow, error: weErr } = await supabase
@@ -160,26 +212,28 @@ export async function POST(req: NextRequest) {
         .insert({
           source: "elevenlabs",
           external_id: null,
-          raw_body: parsedBody,
+          raw_body: weRawBody,
           headers: {
             "elevenlabs-signature": signatureHeader,
-            "elevenlabs-signature-timestamp": timestampHeader,
             "content-type": contentTypeHeader,
           },
         })
         .select("id")
         .single();
       if (weErr) {
-        // Forensic insert is best-effort — never blocks the webhook.
-        logEvent("error", "webhook_events insert failed (continuing)", { err: weErr.message });
+        logEvent("error", "webhook_events insert failed (continuing)", {
+          err: weErr.message,
+        });
       } else {
         webhookEventId = weRow?.id ?? null;
       }
     } catch (e: any) {
-      logEvent("error", "webhook_events insert threw (continuing)", { err: e?.message });
+      logEvent("error", "webhook_events insert threw (continuing)", {
+        err: e?.message,
+      });
     }
 
-    // ===== Step 2: HMAC + timestamp skew verification =====
+    // ===== Step 2: signature + timestamp skew =====
     if (!WEBHOOK_SECRET) {
       logEvent("error", "ELEVENLABS_WEBHOOK_SECRET not configured");
       return errorResponse(
@@ -189,51 +243,61 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const timestampSeconds = Number(timestampHeader);
-    if (!Number.isFinite(timestampSeconds)) {
+    const parsedSig = parseSignatureHeader(signatureHeader);
+    if (!parsedSig) {
       if (webhookEventId) {
         await supabase
           .from("webhook_events")
-          .update({ processing_error: "invalid_signature" })
+          .update({ processing_error: "invalid_signature_header" })
           .eq("id", webhookEventId);
       }
-      logEvent("warn", "timestamp header not numeric");
-      return errorResponse(400, "MISSING_TIMESTAMP", "timestamp header malformed");
+      logEvent("warn", "missing or malformed ElevenLabs-Signature header");
+      return errorResponse(
+        400,
+        "INVALID_SIGNATURE_HEADER",
+        "missing or malformed signature header"
+      );
     }
 
     const nowSeconds = Date.now() / 1000;
-    if (Math.abs(nowSeconds - timestampSeconds) > MAX_SKEW_SECONDS) {
+    if (Math.abs(nowSeconds - parsedSig.ts) > MAX_SKEW_SECONDS) {
       if (webhookEventId) {
         await supabase
           .from("webhook_events")
           .update({ processing_error: "stale_timestamp" })
           .eq("id", webhookEventId);
       }
-      logEvent("warn", "stale webhook timestamp", { timestampSeconds, nowSeconds });
-      return errorResponse(401, "STALE_TIMESTAMP", "timestamp outside 5-minute skew window");
+      logEvent("warn", "stale webhook timestamp", {
+        ts: parsedSig.ts,
+        nowSeconds,
+      });
+      return errorResponse(
+        401,
+        "STALE_TIMESTAMP",
+        "timestamp outside 30-minute skew window"
+      );
     }
 
     const expectedHex = crypto
       .createHmac("sha256", WEBHOOK_SECRET)
-      .update(`${timestampHeader}.${rawBody}`)
+      .update(`${parsedSig.ts}.${rawBody}`)
       .digest("hex");
 
-    const providedHex = extractSignatureHex(signatureHeader);
-
-    if (!providedHex || !timingSafeEqualHex(expectedHex, providedHex)) {
+    if (!timingSafeEqualHex(expectedHex, parsedSig.hex)) {
       if (webhookEventId) {
         await supabase
           .from("webhook_events")
           .update({ processing_error: "invalid_signature" })
           .eq("id", webhookEventId);
       }
-      logEvent("warn", "invalid signature", { hasHeader: !!signatureHeader });
+      logEvent("warn", "invalid signature");
       return errorResponse(401, "INVALID_SIGNATURE", "signature verification failed");
     }
 
-    // ===== Step 3: extract fields (defensive) =====
-    const conversationId =
-      pick<string>(parsedBody, ["conversation_id", "data.conversation_id"]) ?? null;
+    // ===== Step 3: dispatch on event type =====
+    const type: string | null = parsedBody?.type ?? null;
+    const data = parsedBody?.data ?? {};
+    const conversationId: string | null = data?.conversation_id ?? null;
 
     if (!conversationId) {
       if (webhookEventId) {
@@ -245,53 +309,9 @@ export async function POST(req: NextRequest) {
           })
           .eq("id", webhookEventId);
       }
-      logEvent("warn", "payload missing conversation_id");
-      return errorResponse(400, "INVALID_BODY", "missing conversation_id");
+      return errorResponse(400, "INVALID_BODY", "missing data.conversation_id");
     }
 
-    const transcriptFull =
-      pick<unknown>(parsedBody, ["transcript", "data.transcript"]) ?? null;
-    const summary =
-      pick<string>(parsedBody, [
-        "analysis.summary",
-        "data.analysis.summary",
-        "summary",
-      ]) ?? null;
-    const sentiment =
-      pick<string>(parsedBody, [
-        "analysis.sentiment",
-        "data.analysis.sentiment",
-        "sentiment",
-      ]) ?? null;
-    const successEvaluation =
-      pick<unknown>(parsedBody, [
-        "analysis.success_evaluation",
-        "data.analysis.success_evaluation",
-        "success_evaluation",
-      ]) ?? null;
-    const audioUrl =
-      pick<string>(parsedBody, ["audio_url", "data.audio_url"]) ?? null;
-    const durationSeconds =
-      pick<number>(parsedBody, ["duration_seconds", "data.duration_seconds"]) ?? null;
-    const endedAtRaw = pick<string | number>(parsedBody, ["ended_at", "data.ended_at"]);
-    const startedAtRaw = pick<string | number>(parsedBody, [
-      "started_at",
-      "data.started_at",
-    ]);
-    let endedAtIso: string | null = null;
-    if (endedAtRaw) {
-      const d = new Date(endedAtRaw as any);
-      if (!isNaN(d.getTime())) endedAtIso = d.toISOString();
-    } else if (startedAtRaw && typeof durationSeconds === "number") {
-      const startMs = new Date(startedAtRaw as any).getTime();
-      if (!isNaN(startMs)) endedAtIso = new Date(startMs + durationSeconds * 1000).toISOString();
-    }
-
-    const toolCalls =
-      pick<any[]>(parsedBody, ["tool_calls", "data.tool_calls", "analysis.tool_calls"]) ??
-      [];
-
-    // Backfill webhook_events.external_id for traceability.
     if (webhookEventId) {
       await supabase
         .from("webhook_events")
@@ -299,152 +319,343 @@ export async function POST(req: NextRequest) {
         .eq("id", webhookEventId);
     }
 
-    // ===== Step 4: lookup call by elevenlabs_conversation_id =====
-    const { data: callRow, error: callLookupErr } = await supabase
-      .from("calls")
-      .select("id, tenant_id, webhook_processed_at")
-      .eq("elevenlabs_conversation_id", conversationId)
-      .maybeSingle();
-
-    if (callLookupErr) {
-      logEvent("error", "call lookup failed", { err: callLookupErr.message });
-      // Treat as transient — let EL retry.
-      return errorResponse(500, "INTERNAL", "call lookup failed");
+    if (type === "post_call_transcription") {
+      return await handleTranscription({
+        supabase,
+        data,
+        conversationId,
+        webhookEventId,
+      });
     }
 
-    if (!callRow) {
-      logEvent("warn", "no matching call for conversation_id", { conversationId });
-      if (webhookEventId) {
-        await supabase
-          .from("webhook_events")
-          .update({
-            processing_error: "no_matching_call",
-            processed_at: new Date().toISOString(),
-          })
-          .eq("id", webhookEventId);
+    if (type === "post_call_audio") {
+      return await handleAudio({
+        supabase,
+        data,
+        conversationId,
+        webhookEventId,
+      });
+    }
+
+    logEvent("warn", "unknown webhook event type", { type });
+    if (webhookEventId) {
+      await supabase
+        .from("webhook_events")
+        .update({
+          processing_error: `unknown_type:${type ?? "null"}`,
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", webhookEventId);
+    }
+    // 200 to prevent retry storms on unknown types.
+    return NextResponse.json({ ok: true, ignored: true, type });
+  } catch (err: any) {
+    // 5xx → EL will retry. That's intended.
+    logEvent("error", "unhandled webhook error", {
+      err: err?.message,
+      stack: err?.stack,
+    });
+    return errorResponse(500, "INTERNAL", err?.message ?? "internal error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// post_call_transcription
+// ---------------------------------------------------------------------------
+async function handleTranscription(args: {
+  supabase: ReturnType<typeof createAdminClient>;
+  data: any;
+  conversationId: string;
+  webhookEventId: string | null;
+}) {
+  const { supabase, data, conversationId, webhookEventId } = args;
+
+  const transcriptFull = data?.transcript ?? null;
+  const summary: string | null = data?.analysis?.transcript_summary ?? null;
+  const successEvaluation = data?.analysis?.call_successful ?? null;
+
+  // ended_at derivation from conversation timing details.
+  // Field shape under data.conversation isn't fully pinned; probe a few.
+  let endedAtIso: string | null = null;
+  const conv = data?.conversation ?? {};
+  const endedAtRaw =
+    conv?.ended_at ??
+    conv?.end_time ??
+    conv?.finished_at ??
+    null;
+  if (endedAtRaw) {
+    const d = new Date(endedAtRaw);
+    if (!isNaN(d.getTime())) endedAtIso = d.toISOString();
+  } else if (conv?.start_time && typeof conv?.duration_seconds === "number") {
+    const startMs = new Date(conv.start_time).getTime();
+    if (!isNaN(startMs)) {
+      endedAtIso = new Date(startMs + conv.duration_seconds * 1000).toISOString();
+    }
+  }
+
+  // ===== Lookup call row =====
+  const { data: callRow, error: callLookupErr } = await supabase
+    .from("calls")
+    .select("id, tenant_id, webhook_processed_at, audio_archive_status")
+    .eq("elevenlabs_conversation_id", conversationId)
+    .maybeSingle();
+
+  if (callLookupErr) {
+    logEvent("error", "call lookup failed", { err: callLookupErr.message });
+    return errorResponse(500, "INTERNAL", "call lookup failed");
+  }
+
+  if (!callRow) {
+    // No matching call row. We cannot stage the transcript (tenant_id NOT NULL
+    // on calls). Ack idempotently — orchestrator decides how to handle.
+    logEvent("warn", "no matching call for conversation_id", { conversationId });
+    if (webhookEventId) {
+      await supabase
+        .from("webhook_events")
+        .update({
+          processing_error: "no_matching_call",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", webhookEventId);
+    }
+    return NextResponse.json({
+      ok: true,
+      call_id: null,
+      conversation_id: conversationId,
+    });
+  }
+
+  const callId: string = callRow.id;
+  const tenantId: string = callRow.tenant_id;
+
+  // ===== Atomic idempotent UPDATE on calls =====
+  // Gate: `webhook_processed_at IS NULL` — first delivery wins.
+  // Note: we do NOT write sentiment — leave NULL as per spec.
+  const { data: updatedRows, error: updateErr } = await supabase
+    .from("calls")
+    .update({
+      transcript_full: transcriptFull,
+      summary,
+      success_evaluation: successEvaluation,
+      ended_at: endedAtIso ?? undefined,
+      webhook_processed_at: new Date().toISOString(),
+    })
+    .eq("elevenlabs_conversation_id", conversationId)
+    .is("webhook_processed_at", null)
+    .select("id");
+
+  if (updateErr) {
+    logEvent("error", "calls update failed", {
+      err: updateErr.message,
+      callId,
+    });
+    return errorResponse(500, "INTERNAL", "calls update failed");
+  }
+
+  if (!updatedRows || updatedRows.length === 0) {
+    // Already processed by a previous delivery.
+    logEvent("info", "transcription already processed (idempotent replay)", {
+      callId,
+    });
+    if (webhookEventId) {
+      await supabase
+        .from("webhook_events")
+        .update({
+          processing_error: "already_processed",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", webhookEventId);
+    }
+    return NextResponse.json({
+      ok: true,
+      call_id: callId,
+      conversation_id: conversationId,
+    });
+  }
+
+  // ===== Tool call invocations (embedded inside transcript turns) =====
+  // TODO: confirm exact tool call shape in transcript items.
+  // The EL transcript is an array of turn objects; tool calls appear inline.
+  // We probe common field names defensively.
+  if (Array.isArray(transcriptFull)) {
+    const toolRows: any[] = [];
+    for (const turn of transcriptFull) {
+      // Possible shapes: turn.tool_calls[], turn.tool_call, turn.tool
+      const candidates: any[] = [];
+      if (Array.isArray(turn?.tool_calls)) candidates.push(...turn.tool_calls);
+      if (turn?.tool_call) candidates.push(turn.tool_call);
+      if (turn?.tool && (turn.tool.name || turn.tool.tool_name)) {
+        candidates.push(turn.tool);
       }
-      // 200 — idempotent no-op, prevent EL retry storms.
-      return NextResponse.json({ ok: true, call_id: null, conversation_id: conversationId });
+
+      for (const tc of candidates) {
+        const name = tc?.name ?? tc?.tool_name ?? null;
+        const startedAt =
+          tc?.started_at ??
+          tc?.start_time ??
+          tc?.timestamp ??
+          turn?.timestamp ??
+          turn?.time_in_call_seconds ??
+          null;
+        if (!name || startedAt == null) continue;
+
+        // startedAt may be a number (seconds since call start) — convert to
+        // ISO using ended_at or now() as anchor if we have to. Cleaner once
+        // shape is pinned.
+        let startedAtIso: string | null = null;
+        if (typeof startedAt === "string") {
+          const d = new Date(startedAt);
+          if (!isNaN(d.getTime())) startedAtIso = d.toISOString();
+        } else if (typeof startedAt === "number") {
+          // Treat as absolute unix seconds if > 10^9, else skip (we lack a
+          // reliable call-start anchor here).
+          if (startedAt > 1_000_000_000) {
+            startedAtIso = new Date(startedAt * 1000).toISOString();
+          }
+        }
+        if (!startedAtIso) continue;
+
+        toolRows.push({
+          call_id: callId,
+          tenant_id: tenantId,
+          name,
+          args: tc?.args ?? tc?.parameters ?? tc?.input ?? null,
+          result: tc?.result ?? tc?.output ?? null,
+          is_error: !!(tc?.is_error ?? tc?.error),
+          started_at: startedAtIso,
+          ended_at: tc?.ended_at
+            ? new Date(tc.ended_at).toISOString()
+            : null,
+        });
+      }
     }
 
-    const callId: string = callRow.id;
-    const tenantId: string = callRow.tenant_id;
+    if (toolRows.length > 0) {
+      const { error: tiErr } = await supabase
+        .from("call_tool_invocations")
+        .upsert(toolRows, {
+          onConflict: "call_id,name,started_at",
+          ignoreDuplicates: true,
+        });
+      if (tiErr) {
+        logEvent("error", "call_tool_invocations insert failed (continuing)", {
+          err: tiErr.message,
+          callId,
+          count: toolRows.length,
+        });
+      }
+    }
+  }
 
-    // ===== Step 5: atomic idempotent UPDATE on calls =====
-    // PostgREST emulates the `WHERE webhook_processed_at IS NULL` gate via .is(...).
-    // The combination of the eq filter on conversation_id + is null on
-    // webhook_processed_at is the canonical idempotency gate.
-    const { data: updatedRows, error: updateErr } = await supabase
+  // ===== Audio reconciliation: did post_call_audio arrive first? =====
+  // If yes, the file lives at pending/{conversation_id}.mp3 — move it into
+  // place under {tenant_id}/{call_id}.mp3 and mark archived. Otherwise set
+  // pending and wait for the audio webhook.
+  const dst = await movePendingToFinal(
+    supabase,
+    conversationId,
+    tenantId,
+    callId,
+    (lvl, msg, extra) => logEvent(lvl, msg, extra)
+  );
+
+  if (dst) {
+    await supabase
       .from("calls")
       .update({
-        transcript_full: transcriptFull,
-        summary,
-        sentiment,
-        success_evaluation: successEvaluation,
-        ended_at: endedAtIso ?? undefined, // skip if null so we don't clobber an existing value
-        webhook_processed_at: new Date().toISOString(),
-        audio_archive_status: "pending",
+        audio_storage_path: dst,
+        audio_archive_status: "archived",
       })
-      .eq("elevenlabs_conversation_id", conversationId)
-      .is("webhook_processed_at", null)
-      .select("id");
+      .eq("id", callId);
+  } else {
+    // No staged audio — normal case, set pending.
+    await supabase
+      .from("calls")
+      .update({ audio_archive_status: "pending" })
+      .eq("id", callId)
+      .is("audio_storage_path", null);
+  }
 
-    if (updateErr) {
-      logEvent("error", "calls update failed", { err: updateErr.message, callId });
-      return errorResponse(500, "INTERNAL", "calls update failed");
-    }
+  if (webhookEventId) {
+    await supabase
+      .from("webhook_events")
+      .update({
+        processed_at: new Date().toISOString(),
+        processing_error: null,
+      })
+      .eq("id", webhookEventId);
+  }
 
-    if (!updatedRows || updatedRows.length === 0) {
-      // Already processed by a previous delivery — idempotent no-op.
-      logEvent("info", "webhook already processed (idempotent replay)", { callId });
-      if (webhookEventId) {
-        await supabase
-          .from("webhook_events")
-          .update({
-            processing_error: "already_processed",
-            processed_at: new Date().toISOString(),
-          })
-          .eq("id", webhookEventId);
-      }
-      return NextResponse.json({ ok: true, call_id: callId, conversation_id: conversationId });
-    }
+  return NextResponse.json({
+    ok: true,
+    call_id: callId,
+    conversation_id: conversationId,
+  });
+}
 
-    // ===== Step 6: insert call_tool_invocations rows (sole writer) =====
-    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
-      const rows = toolCalls
-        .map((tc: any) => {
-          const name = tc?.name ?? tc?.tool_name ?? null;
-          const startedAt =
-            tc?.started_at ?? tc?.start_time ?? tc?.created_at ?? null;
-          const endedAt = tc?.ended_at ?? tc?.end_time ?? tc?.completed_at ?? null;
-          if (!name || !startedAt) return null;
-          return {
-            call_id: callId,
-            tenant_id: tenantId,
-            name,
-            args: tc?.args ?? tc?.parameters ?? tc?.input ?? null,
-            result: tc?.result ?? tc?.output ?? null,
-            is_error: !!(tc?.is_error ?? tc?.error),
-            started_at: new Date(startedAt).toISOString(),
-            ended_at: endedAt ? new Date(endedAt).toISOString() : null,
-          };
+// ---------------------------------------------------------------------------
+// post_call_audio
+// ---------------------------------------------------------------------------
+async function handleAudio(args: {
+  supabase: ReturnType<typeof createAdminClient>;
+  data: any;
+  conversationId: string;
+  webhookEventId: string | null;
+}) {
+  const { supabase, data, conversationId, webhookEventId } = args;
+
+  const fullAudioBase64: string | null = data?.full_audio ?? null;
+  if (!fullAudioBase64 || typeof fullAudioBase64 !== "string") {
+    logEvent("warn", "post_call_audio missing full_audio", { conversationId });
+    if (webhookEventId) {
+      await supabase
+        .from("webhook_events")
+        .update({
+          processing_error: "missing_full_audio",
+          processed_at: new Date().toISOString(),
         })
-        .filter((r): r is NonNullable<typeof r> => r !== null);
-
-      if (rows.length > 0) {
-        // ON CONFLICT (call_id, name, started_at) DO NOTHING via PostgREST upsert
-        // with ignoreDuplicates: true. The unique constraint is defined in the
-        // 2026-04-07 elevenlabs runtime swap migration.
-        const { error: tiErr } = await supabase
-          .from("call_tool_invocations")
-          .upsert(rows, {
-            onConflict: "call_id,name,started_at",
-            ignoreDuplicates: true,
-          });
-        if (tiErr) {
-          // Non-fatal: log and continue. Transcript already saved.
-          logEvent("error", "call_tool_invocations insert failed (continuing)", {
-            err: tiErr.message,
-            callId,
-            count: rows.length,
-          });
-        }
-      }
+        .eq("id", webhookEventId);
     }
+    return errorResponse(400, "INVALID_BODY", "missing data.full_audio");
+  }
 
-    // ===== Step 7: enqueue audio-archive job (async) =====
-    if (audioUrl) {
-      const queue = getAudioArchiveQueue();
-      if (!queue) {
-        logEvent("warn", "REDIS_URL not set; skipping audio-archive enqueue (janitor will sweep)", {
-          callId,
-        });
-      } else {
-        try {
-          await queue.add(
-            "archive",
-            { callId, signedUrl: audioUrl },
-            {
-              jobId: `audio:${callId}`,
-              attempts: 5,
-              backoff: { type: "exponential", delay: 5000 },
-            }
-          );
-        } catch (e: any) {
-          logEvent("error", "audio-archive enqueue failed", { err: e?.message, callId });
-          // Mark as failed; janitor orphan-sweep will pick it up later.
-          await supabase
-            .from("calls")
-            .update({ audio_archive_status: "failed" })
-            .eq("id", callId);
-          // Still return 200 — transcript is saved.
-        }
-      }
-    } else {
-      logEvent("warn", "no audio_url in payload; janitor will sweep", { callId });
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(fullAudioBase64, "base64");
+  } catch (e: any) {
+    logEvent("error", "base64 decode failed", { err: e?.message });
+    return errorResponse(400, "INVALID_BODY", "invalid base64 audio");
+  }
+
+  // Try to find the call row. If it exists → upload to final path. If not →
+  // stage at pending/{conversation_id}.mp3 for the transcription handler to
+  // move later.
+  const { data: callRow, error: lookupErr } = await supabase
+    .from("calls")
+    .select("id, tenant_id, audio_archive_status")
+    .eq("elevenlabs_conversation_id", conversationId)
+    .maybeSingle();
+
+  if (lookupErr) {
+    logEvent("error", "audio: call lookup failed", { err: lookupErr.message });
+    return errorResponse(500, "INTERNAL", "call lookup failed");
+  }
+
+  if (!callRow) {
+    // No call row yet — stage at pending/.
+    const src = pendingPath(conversationId);
+    const { error: upErr } = await uploadAudio(supabase, src, buffer);
+    if (upErr) {
+      logEvent("error", "pending audio upload failed", {
+        err: upErr.message,
+        src,
+      });
+      return errorResponse(500, "INTERNAL", "pending audio upload failed");
     }
-
-    // ===== Step 8: mark webhook_event processed =====
+    logEvent("info", "audio staged to pending/", {
+      conversationId,
+      bytes: buffer.length,
+    });
     if (webhookEventId) {
       await supabase
         .from("webhook_events")
@@ -454,16 +665,73 @@ export async function POST(req: NextRequest) {
         })
         .eq("id", webhookEventId);
     }
-
-    // ===== Step 9: 200 OK =====
     return NextResponse.json({
       ok: true,
-      call_id: callId,
+      staged: true,
       conversation_id: conversationId,
     });
-  } catch (err: any) {
-    // EL will retry on 5xx — that's intended.
-    logEvent("error", "unhandled webhook error", { err: err?.message, stack: err?.stack });
-    return errorResponse(500, "INTERNAL", err?.message ?? "internal error");
   }
+
+  // Idempotency guard on the audio path: if already archived, no-op.
+  if (callRow.audio_archive_status === "archived") {
+    logEvent("info", "audio already archived (idempotent replay)", {
+      callId: callRow.id,
+    });
+    if (webhookEventId) {
+      await supabase
+        .from("webhook_events")
+        .update({
+          processed_at: new Date().toISOString(),
+          processing_error: "already_archived",
+        })
+        .eq("id", webhookEventId);
+    }
+    return NextResponse.json({
+      ok: true,
+      call_id: callRow.id,
+      conversation_id: conversationId,
+    });
+  }
+
+  const dst = finalPath(callRow.tenant_id, callRow.id);
+  const { error: upErr } = await uploadAudio(supabase, dst, buffer);
+  if (upErr) {
+    logEvent("error", "final audio upload failed", {
+      err: upErr.message,
+      dst,
+    });
+    return errorResponse(500, "INTERNAL", "audio upload failed");
+  }
+
+  const { error: updateErr } = await supabase
+    .from("calls")
+    .update({
+      audio_storage_path: dst,
+      audio_archive_status: "archived",
+    })
+    .eq("id", callRow.id)
+    .neq("audio_archive_status", "archived");
+  if (updateErr) {
+    logEvent("error", "calls audio status update failed", {
+      err: updateErr.message,
+      callId: callRow.id,
+    });
+    // Upload succeeded — don't fail the webhook; return 200.
+  }
+
+  if (webhookEventId) {
+    await supabase
+      .from("webhook_events")
+      .update({
+        processed_at: new Date().toISOString(),
+        processing_error: null,
+      })
+      .eq("id", webhookEventId);
+  }
+
+  return NextResponse.json({
+    ok: true,
+    call_id: callRow.id,
+    conversation_id: conversationId,
+  });
 }
