@@ -122,11 +122,62 @@ export class CallBridge {
     this.ttsFirstByteMs = null;
     this.firstAudioReceivedAt = null;
 
+    // State machine (spec 2026-04-08 §2):
+    //   created → pre_warming → pre_warmed → live → finalized
+    this._state = "created";
+    this._stateEnteredAt = Date.now();
+    this._pendingCustomerAnswered = false;
+
     // Metrics
     this.turnCount = 0;
     this.toolCallCount = 0;
     this.inboundAudioChunks = 0;
     this.outboundAudioChunks = 0;
+  }
+
+  /**
+   * Internal state transition helper. Logs every transition and rejects
+   * invalid transitions (logs an error and stays in the source state).
+   * Never throws — defensive.
+   *
+   * Valid graph:
+   *   created      → pre_warming
+   *   pre_warming  → pre_warmed | finalized
+   *   pre_warmed   → live       | finalized
+   *   live         → finalized
+   *   finalized    → (terminal)
+   */
+  _transition(target, reason) {
+    const from = this._state;
+    const valid = {
+      created: ["pre_warming"],
+      pre_warming: ["pre_warmed", "finalized"],
+      pre_warmed: ["live", "finalized"],
+      live: ["finalized"],
+      finalized: [],
+    };
+    if (!valid[from] || !valid[from].includes(target)) {
+      this.log.error(
+        { from, to: target, reason },
+        "call-bridge: invalid state transition — staying in source state",
+      );
+      return;
+    }
+    const now = Date.now();
+    const elapsedMs = this._stateEnteredAt ? now - this._stateEnteredAt : 0;
+    this._stateEnteredAt = now;
+    this._state = target;
+    this.log.info(
+      {
+        event: "call_bridge_state_transition",
+        call_id: this.callId,
+        from,
+        to: target,
+        reason,
+        elapsed_ms_since_start: elapsedMs,
+      },
+      "call-bridge state transition",
+    );
   }
 
   /**
@@ -229,6 +280,7 @@ export class CallBridge {
     this._wireSessionEvents(session);
 
     // ── Step 3: Open the WS ──────────────────────────────────────
+    this._transition("pre_warming", "start_called");
     this.elWsOpenedAt = Date.now();
     try {
       await session.connect();
@@ -244,6 +296,33 @@ export class CallBridge {
   }
 
   _wireSessionEvents(session) {
+    // ws_open fires when the EL WebSocket transport (TCP/TLS/HTTP upgrade)
+    // is ready. We transition from pre_warming → pre_warmed here and wait
+    // for handleCustomerAnswered() before starting the conversation.
+    // If the customer answered faster than the WS handshake completed,
+    // _pendingCustomerAnswered will be set and we transition straight to
+    // live now (draining the queued pickup event).
+    session.on("ws_open", () => {
+      this._transition("pre_warmed", "ws_open");
+      this.elWsOpenMs = Date.now() - this.elWsOpenedAt;
+      if (this._pendingCustomerAnswered) {
+        this._pendingCustomerAnswered = false;
+        this._transition("live", "customer_answered_early");
+        try {
+          this.session.startConversation();
+        } catch (err) {
+          this.log.error(
+            { err },
+            "startConversation threw during pending-customer flush",
+          );
+          this._finalizeAndResolve(
+            "start_conversation_failed",
+            "el_ws_protocol_error",
+          );
+        }
+      }
+    });
+
     session.on("conversation_id", async (conversationId) => {
       this.elWsOpenMs = Date.now() - this.elWsOpenedAt;
       this.log.info({ conversationId, elWsOpenMs: this.elWsOpenMs }, "EL conversation_id received");
@@ -355,12 +434,66 @@ export class CallBridge {
   // ─── Asterisk -> Bridge ────────────────────────────────────────
 
   /**
+   * Signal from server.js that the customer has picked up the phone
+   * (ARI ChannelStateChange → Up on the customer channel). Transitions
+   * the bridge from PRE_WARMED → LIVE and tells the EL session to
+   * begin the conversation.
+   *
+   * Idempotent: a second call logs a warning and no-ops.
+   * If called during PRE_WARMING (race where the customer answered
+   * faster than the WS handshake), the transition is queued and the
+   * ws_open handler will complete it.
+   * If called after FINALIZED, the call logs a warning and is a no-op.
+   *
+   * Spec: docs/superpowers/specs/2026-04-08-el-session-lifecycle-fix-design.md §3.2
+   */
+  handleCustomerAnswered() {
+    if (this._state === "live") {
+      this.log.warn("handleCustomerAnswered called twice — ignoring");
+      return;
+    }
+    if (this._state === "finalized") {
+      this.log.warn("handleCustomerAnswered after finalize — ignoring");
+      return;
+    }
+    if (this._state === "pre_warming") {
+      // Race: customer answered before WS handshake finished.
+      // Queue the transition; the ws_open handler will pick it up.
+      this._pendingCustomerAnswered = true;
+      return;
+    }
+    if (this._state !== "pre_warmed") {
+      this.log.error(
+        { state: this._state },
+        "handleCustomerAnswered in unexpected state",
+      );
+      return;
+    }
+    this._transition("live", "customer_answered");
+    try {
+      this.session.startConversation();
+    } catch (err) {
+      this.log.error(
+        { err },
+        "startConversation threw in handleCustomerAnswered",
+      );
+      this._finalizeAndResolve(
+        "start_conversation_failed",
+        "el_ws_protocol_error",
+      );
+    }
+  }
+
+  /**
    * Handle incoming caller audio from Asterisk via media-bridge.
    * @param {Buffer} audioBuffer slin16 PCM16 16kHz buffer
    */
   handleCallerAudio(audioBuffer) {
-    if (!this.session) return;
-    if (this.finalized) return;
+    if (this._state !== "live") {
+      // Drop ringback / early-media frames (CREATED / PRE_WARMING /
+      // PRE_WARMED states) and any frames that arrive after FINALIZED.
+      return;
+    }
     this.inboundAudioChunks += 1;
     try {
       this.session.sendAudio(audioBuffer);
@@ -376,7 +509,10 @@ export class CallBridge {
    * writes call_metrics, and drains live-turn-writer for this call.
    */
   async _finalizeAndResolve(endReason, failureReason) {
-    if (this.finalized) return;
+    if (this._state === "finalized") return;
+    // Drive the state machine into the terminal state. The transition helper
+    // accepts any source state → finalized (per the valid graph in _transition).
+    this._transition("finalized", endReason || "finalize");
     this.finalized = true;
     this.endReason = endReason;
     this.failureReason = failureReason || null;
