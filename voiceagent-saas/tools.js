@@ -1,17 +1,23 @@
 // voiceagent-saas/tools.js
+//
+// Vendor-clean: provider-specific schema conversion lives in *-tools-adapter.js
+// (e.g. elevenlabs-tools-adapter.js). This file owns the canonical tool names,
+// descriptions, parameter schemas, and implementations. It must not import
+// from or reference any LLM vendor SDK.
 
 /**
- * SaaS tool definitions for Gemini Live function calling.
+ * SaaS tool definitions for the voice agent.
  *
  * Lead qualification tools: score_lead, send_whatsapp,
  * request_callback, mark_opt_out, end_call.
  */
 
-// ─── Gemini Tool Definitions ────────────────────────────────────────
+// ─── Tool Definitions ───────────────────────────────────────────────
 
 /**
- * Build Gemini function declarations for the SaaS tools.
- * Returns the object format expected by Gemini Live setup payload.
+ * Build the canonical tool declarations for the SaaS voice agent.
+ * Vendor adapters (elevenlabs-tools-adapter.js) translate these into
+ * provider-specific shapes.
  */
 export function buildToolDefinitions() {
   return {
@@ -106,8 +112,8 @@ export function buildToolDefinitions() {
 // ─── Tool Execution ─────────────────────────────────────────────────
 
 /**
- * Execute a Gemini tool call. Routes to the appropriate handler
- * and returns the result to send back to Gemini.
+ * Execute a tool call by name. Vendor-neutral — routes to the appropriate
+ * handler and returns the result for the caller to deliver back to the LLM.
  */
 export async function executeToolCall(name, args, context) {
   const started = Date.now();

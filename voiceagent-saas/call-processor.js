@@ -23,8 +23,6 @@
 
 import { Worker, Queue } from "bullmq";
 import { createClient } from "@supabase/supabase-js";
-import { createWriteStream, mkdirSync, existsSync, unlinkSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { CallBridge, preRegisterBridge } from "./call-bridge.js";
 import { ComplianceGate, DncEnforcer, isWithinScheduleWindows } from "./compliance.js";
 import { executeToolCall, buildToolDefinitions } from "./tools.js";
@@ -34,11 +32,37 @@ import { WhatsAppClient } from "./whatsapp-client.js";
 
 const CALL_QUEUE_NAME = "call-jobs";
 const MONTHLY_RESET_QUEUE_NAME = "monthly-reset";
-const RECORDINGS_DIR = "/tmp/recordings";
 
-// Ensure recordings directory exists
-if (!existsSync(RECORDINGS_DIR)) {
-  mkdirSync(RECORDINGS_DIR, { recursive: true });
+// Failure reasons that justify a retry (subject to daily cap, with bump).
+const RETRYABLE_FAILURE_REASONS = new Set([
+  "voicenter_busy",
+  "el_ws_connect_failed",
+  "el_ws_dropped",
+  "no_answer",
+  "network_error",
+  "agent_not_ready",
+]);
+
+// Non-retryable: mark contact and stop.
+const NON_RETRYABLE_FAILURE_REASONS = new Set([
+  "dnc_listed",
+  "invalid_number",
+  "compliance_block",
+]);
+
+// Special case: re-enqueue WITHOUT bumping daily_retry_count.
+const TRANSPARENT_RETRY_REASONS = new Set(["agent_version_mismatch"]);
+
+// Backoff schedule (ms) by current retry_count (capped at last entry).
+const RETRY_BACKOFF_MS = [15 * 60 * 1000, 60 * 60 * 1000, 4 * 60 * 60 * 1000];
+const MAX_DAILY_RETRIES = 3;
+
+/**
+ * Compute today's date in Israel timezone (DST-correct), as ISO yyyy-mm-dd.
+ * Uses sv-SE locale because it formats as ISO. Spec §5.2.
+ */
+function israelTodayIso() {
+  return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jerusalem" });
 }
 
 // ─── Supabase Client ───────────────────────────────────────────────
@@ -245,63 +269,9 @@ class AuditLogDAL {
 }
 
 // ─── Recording Helpers ─────────────────────────────────────────────
-
-/**
- * Create a recording file writer for a call.
- * Returns { appendChunk, finalize } — finalize reads the file, uploads
- * to Supabase Storage, and deletes the temp file.
- */
-function createRecordingWriter(callId) {
-  const filePath = join(RECORDINGS_DIR, `${callId}.raw`);
-  const stream = createWriteStream(filePath, { flags: "w" });
-  let hasData = false;
-
-  return {
-    appendChunk(pcmBuffer) {
-      if (pcmBuffer && pcmBuffer.length > 0) {
-        stream.write(pcmBuffer);
-        hasData = true;
-      }
-    },
-
-    async finalize(db, tenantId) {
-      stream.end();
-
-      // Wait for stream to finish writing
-      await new Promise((resolve) => stream.on("finish", resolve));
-
-      if (!hasData || !existsSync(filePath)) {
-        return null;
-      }
-
-      try {
-        const fileData = readFileSync(filePath);
-        const storagePath = `${tenantId}/recordings/${callId}.raw`;
-
-        const { error: uploadError } = await db.storage
-          .from("recordings")
-          .upload(storagePath, fileData, {
-            contentType: "audio/pcm",
-            upsert: true,
-          });
-
-        if (uploadError) {
-          console.error(`[call-processor] Recording upload failed for ${callId}:`, uploadError);
-          return null;
-        }
-
-        return storagePath;
-      } finally {
-        // Clean up temp file
-        try {
-          unlinkSync(filePath);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-    },
-  };
-}
+// Recording capture is now handled by ElevenLabs + audio-archive-processor
+// (signed URL → call-recordings bucket). The local PCM writer was removed
+// in T12 along with the slin16 audio-out path through Gemini.
 
 // ─── WhatsApp Sender (Green API via WhatsAppClient) ────────────────
 
@@ -378,6 +348,76 @@ async function processCallJob(job, config) {
     return;
   }
 
+  // -- Step 1b: Snapshot agent_id_used + sync_version_used (T11.1) --
+  // Re-fetch the campaign row right at dequeue to shrink the deploy/sync
+  // race window. The values we capture here are pinned into the calls row
+  // and the call-bridge cfg so the EL session is always pinned to a single
+  // (agent_id, sync_version) tuple for its lifetime.
+  let agentIdUsed = null;
+  let syncVersionUsed = null;
+  try {
+    const { data: freshCampaign, error: freshErr } = await db
+      .from("campaigns")
+      .select("id, elevenlabs_agent_id, sync_version, agent_status, voice_id")
+      .eq("id", campaignId)
+      .single();
+    if (freshErr) throw freshErr;
+
+    // Hard-fail guards (do NOT bump daily_retry_count). Each failure writes
+    // failure_reason='agent_not_ready' (DUAL WRITE to legacy text + new enum).
+    if (freshCampaign.voice_id == null) {
+      log.warn({ campaignId }, "voice_id_not_set — agent_not_ready");
+      await writeAgentNotReadyCall(db, {
+        tenantId,
+        campaignId,
+        contactId,
+        campaignContactId,
+        agentIdUsed: freshCampaign.elevenlabs_agent_id,
+        syncVersionUsed: freshCampaign.sync_version,
+        note: "voice_id_not_set",
+      });
+      await campaignContactDal.updateStatus(campaignContactId, "needs_attention");
+      return;
+    }
+    if (freshCampaign.agent_status !== "ready") {
+      log.warn({ campaignId, status: freshCampaign.agent_status }, "agent_status_not_ready");
+      await writeAgentNotReadyCall(db, {
+        tenantId,
+        campaignId,
+        contactId,
+        campaignContactId,
+        agentIdUsed: freshCampaign.elevenlabs_agent_id,
+        syncVersionUsed: freshCampaign.sync_version,
+        note: `agent_status=${freshCampaign.agent_status}`,
+      });
+      await campaignContactDal.updateStatus(campaignContactId, "needs_attention");
+      return;
+    }
+    if (freshCampaign.elevenlabs_agent_id == null) {
+      log.warn({ campaignId }, "elevenlabs_agent_id_null");
+      await writeAgentNotReadyCall(db, {
+        tenantId,
+        campaignId,
+        contactId,
+        campaignContactId,
+        agentIdUsed: null,
+        syncVersionUsed: freshCampaign.sync_version,
+        note: "elevenlabs_agent_id_null",
+      });
+      await campaignContactDal.updateStatus(campaignContactId, "needs_attention");
+      return;
+    }
+
+    agentIdUsed = freshCampaign.elevenlabs_agent_id;
+    syncVersionUsed = freshCampaign.sync_version;
+    // Stamp into job payload for downstream visibility (e.g. retry logic).
+    job.data.agentIdUsed = agentIdUsed;
+    job.data.syncVersionUsed = syncVersionUsed;
+  } catch (err) {
+    log.error({ err }, "campaign snapshot fetch failed");
+    return;
+  }
+
   // -- Step 2: Validate preconditions --
   // Use the ported ComplianceGate for pre-call checks
   const dncEnforcer = new DncEnforcer(contactDal, auditLogDal, campaignContactDal);
@@ -413,6 +453,8 @@ async function processCallJob(job, config) {
     campaign_contact_id: campaignContactId,
     status: "initiated",
     started_at: new Date().toISOString(),
+    agent_id_used: agentIdUsed,
+    sync_version_used: syncVersionUsed,
   });
   const callId = callRecord.id;
   log.info({ callId }, "Call record created");
@@ -442,9 +484,6 @@ async function processCallJob(job, config) {
     await campaignContactDal.updateStatus(campaignContactId, "failed");
     return;
   }
-
-  // -- Step 5: Set up recording writer --
-  const recording = createRecordingWriter(callId);
 
   // -- Step 6: Build WhatsApp client for tool context --
   const whatsAppClient = new WhatsAppClient(
@@ -493,32 +532,41 @@ async function processCallJob(job, config) {
   // -- Step 8: Inject recording consent into script --
   const enhancedScript = complianceGate.injectRecordingConsent(campaign.script || "");
 
-  // -- Step 9: Start call bridge --
+  // -- Step 9: Start call bridge (ElevenLabs runtime) --
   const bridge = new CallBridge({
     callId,
     tenantId,
     campaignId,
     contactId,
     campaignContactId,
+    // Snapshot pinned at dequeue (T11.1) — used by call-bridge CAS check.
+    agentIdUsed,
+    syncVersionUsed,
+    supabase: db,
     contactPhone: contact.phone,
     contactName: contact.name,
     campaign: {
+      id: campaignId,
+      name: campaign.name,
       script: enhancedScript,
       questions: campaign.questions,
+      voice_id: campaign.voice_id,
+      first_message: campaign.first_message || null,
       whatsapp_followup_template: campaign.whatsapp_followup_template,
       whatsapp_followup_link: campaign.whatsapp_followup_link,
     },
     tenant: {
+      id: tenantId,
       name: tenant.name,
       business_type: tenant.business_type,
     },
     contact: {
+      id: contactId,
       name: contact.name,
       phone: contact.phone,
       custom_fields: contact.custom_fields,
     },
     toolContext,
-    onRecordingChunk: (pcmBuffer) => recording.appendChunk(pcmBuffer),
     log,
   });
 
@@ -534,11 +582,22 @@ async function processCallJob(job, config) {
     log.error({ err }, "Gateway call initiation failed");
     await callDal.update(callId, {
       status: "failed",
-      failure_reason: err instanceof Error ? err.message : "gateway_initiation_failed",
+      failure_reason: "voicenter_busy",
+      failure_reason_t: "voicenter_busy",
       ended_at: new Date().toISOString(),
     });
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
     bridge.cleanup();
+    // Treat as retryable.
+    await handleRetryDecision({
+      db,
+      log,
+      job,
+      tenantId,
+      campaignContactId,
+      campaignContact,
+      failureReason: "voicenter_busy",
+      retryQueueName: CALL_QUEUE_NAME,
+    });
     return;
   }
 
@@ -546,11 +605,21 @@ async function processCallJob(job, config) {
     log.error({ error: callInitResult.error }, "Gateway call initiation returned failure");
     await callDal.update(callId, {
       status: "failed",
-      failure_reason: callInitResult.error ?? "gateway_initiation_failed",
+      failure_reason: "voicenter_busy",
+      failure_reason_t: "voicenter_busy",
       ended_at: new Date().toISOString(),
     });
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
     bridge.cleanup();
+    await handleRetryDecision({
+      db,
+      log,
+      job,
+      tenantId,
+      campaignContactId,
+      campaignContact,
+      failureReason: "voicenter_busy",
+      retryQueueName: CALL_QUEUE_NAME,
+    });
     return;
   }
 
@@ -565,11 +634,20 @@ async function processCallJob(job, config) {
     log.error({ err }, "Call bridge threw unexpectedly");
     await callDal.update(callId, {
       status: "failed",
-      failure_reason: err instanceof Error ? err.message : "bridge_error",
+      failure_reason: "network_error",
+      failure_reason_t: "network_error",
       ended_at: new Date().toISOString(),
     });
-    await campaignContactDal.updateStatus(campaignContactId, "failed");
-    await recording.finalize(db, tenantId);
+    await handleRetryDecision({
+      db,
+      log,
+      job,
+      tenantId,
+      campaignContactId,
+      campaignContact,
+      failureReason: "network_error",
+      retryQueueName: CALL_QUEUE_NAME,
+    });
     return;
   }
 
@@ -578,110 +656,223 @@ async function processCallJob(job, config) {
     {
       duration: bridgeResult.duration_seconds,
       endReason: bridgeResult.endReason,
-      transcriptParts: bridgeResult.transcript?.length ?? 0,
+      failureReason: bridgeResult.failureReason,
     },
     "Call bridge completed, starting post-call processing"
   );
 
-  // Determine final call status
-  const isNoAnswer =
-    bridgeResult.endReason === "no_answer" ||
-    bridgeResult.endReason === "voicenter_no_answer" ||
-    bridgeResult.duration_seconds < 5;
+  // Re-read the calls row to learn the canonical failure_reason_t that
+  // call-bridge wrote during finalize (single source of truth).
+  const finalCallRow = await callDal.getById(callId);
+  const failureReason = finalCallRow?.failure_reason_t || finalCallRow?.failure_reason || null;
 
-  const finalStatus = isNoAnswer ? "no_answer" : "completed";
-
-  // Update call record with final data
-  await callDal.update(callId, {
-    status: finalStatus,
-    ended_at: new Date().toISOString(),
-    duration_seconds: bridgeResult.duration_seconds,
-  });
-
-  // Upload recording to Supabase Storage
-  const recordingPath = await recording.finalize(db, tenantId);
-  if (recordingPath) {
-    await callDal.update(callId, { recording_path: recordingPath });
-    log.info({ recordingPath }, "Recording uploaded");
-  }
-
-  // Save transcript
-  if (bridgeResult.transcript && bridgeResult.transcript.length > 0) {
-    const transcriptWithTimestamps = bridgeResult.transcript.map((t) => ({
-      ...t,
-      timestamp: t.timestamp || new Date().toISOString(),
-    }));
-    await transcriptDal.save(callId, transcriptWithTimestamps);
-  }
-
-  // Update campaign_contact status
-  if (isNoAnswer) {
-    // Retry logic: re-enqueue if under max attempts
-    const maxRetries = campaign.max_retry_attempts || 3;
-    if (campaignContact.attempt_count + 1 < maxRetries) {
-      const retryDelay = (campaign.retry_delay_minutes || 30) * 60 * 1000;
-      const nextRetryAt = new Date(Date.now() + retryDelay).toISOString();
-      await campaignContactDal.updateStatus(campaignContactId, "no_answer", {
-        next_retry_at: nextRetryAt,
-        attempt_count: campaignContact.attempt_count + 1,
-      });
-      log.info(
-        { nextRetryAt, attemptCount: campaignContact.attempt_count + 1 },
-        "No answer — scheduled retry"
-      );
-    } else {
-      await campaignContactDal.updateStatus(campaignContactId, "no_answer", {
-        attempt_count: campaignContact.attempt_count + 1,
-      });
-      log.info("No answer — max retries reached");
-    }
+  if (failureReason) {
+    // Failed call: route through retry decision (sole writer of
+    // daily_retry_count + last_retry_day).
+    await handleRetryDecision({
+      db,
+      log,
+      job,
+      tenantId,
+      campaignContactId,
+      campaignContact,
+      failureReason,
+      retryQueueName: CALL_QUEUE_NAME,
+    });
   } else {
+    // Successful call.
+    await callDal.update(callId, {
+      status: "completed",
+      duration_seconds: bridgeResult.duration_seconds,
+    });
     await campaignContactDal.updateStatus(campaignContactId, "completed", {
       call_id: callId,
       attempt_count: campaignContact.attempt_count + 1,
     });
   }
 
-  // Send WhatsApp for hot/warm leads (if not already sent by tool)
-  const updatedCall = await callDal.getById(callId);
-  if (
-    updatedCall &&
-    !updatedCall.whatsapp_sent &&
-    (updatedCall.lead_status === "hot" || updatedCall.lead_status === "warm") &&
-    campaign.whatsapp_followup_template
-  ) {
-    const whatsappMessage = WhatsAppClient.interpolateTemplate(
-      campaign.whatsapp_followup_template,
-      {
-        name: contact.name,
-        link: campaign.whatsapp_followup_link || "",
-      }
-    );
-    await sendWhatsApp(contact.phone, whatsappMessage);
+  // Send WhatsApp for hot/warm leads (if not already sent by tool).
+  // Skip on failed calls.
+  if (!failureReason) {
+    const updatedCall = finalCallRow;
+    if (
+      updatedCall &&
+      !updatedCall.whatsapp_sent &&
+      (updatedCall.lead_status === "hot" || updatedCall.lead_status === "warm") &&
+      campaign.whatsapp_followup_template
+    ) {
+      const whatsappMessage = WhatsAppClient.interpolateTemplate(
+        campaign.whatsapp_followup_template,
+        {
+          name: contact.name,
+          link: campaign.whatsapp_followup_link || "",
+        }
+      );
+      await sendWhatsApp(contact.phone, whatsappMessage);
+    }
+
+    // Audit log: call_end
+    await complianceGate.logCallEnd({
+      callId,
+      contactId,
+      campaignId,
+      disposition: "completed",
+      durationSeconds: bridgeResult.duration_seconds,
+      leadStatus: updatedCall?.lead_status ?? null,
+    });
+
+    // Recording consent audit
+    await complianceGate.logRecordingConsent(callId);
   }
-
-  // Audit log: call_end
-  await complianceGate.logCallEnd({
-    callId,
-    contactId,
-    campaignId,
-    disposition: finalStatus,
-    durationSeconds: bridgeResult.duration_seconds,
-    leadStatus: updatedCall?.lead_status ?? null,
-  });
-
-  // Recording consent audit
-  await complianceGate.logRecordingConsent(callId);
 
   log.info(
     {
       callId,
       duration: bridgeResult.duration_seconds,
-      status: finalStatus,
-      leadStatus: updatedCall?.lead_status,
+      failureReason,
     },
     "Call job processing complete"
   );
+}
+
+// ─── Retry / Daily Cap Helper (T11.2 / T11.3 — sole writer) ────────
+
+/**
+ * Decide what to do after a failed call: re-enqueue, mark needs_attention,
+ * or mark failed. This is the SOLE writer of campaign_contacts.daily_retry_count
+ * and last_retry_day. DST-correct via Asia/Jerusalem date.
+ *
+ * agent_version_mismatch is a transparent retry — re-enqueues without
+ * incrementing daily_retry_count and is exempt from the daily cap. The fresh
+ * snapshot at next dequeue resolves the drift.
+ */
+async function handleRetryDecision({
+  db,
+  log,
+  job,
+  tenantId,
+  campaignContactId,
+  campaignContact,
+  failureReason,
+  retryQueueName,
+}) {
+  // Non-retryable: stop, mark needs_attention.
+  if (NON_RETRYABLE_FAILURE_REASONS.has(failureReason)) {
+    log.info({ failureReason }, "non-retryable failure, marking needs_attention");
+    await db
+      .from("campaign_contacts")
+      .update({ status: "needs_attention", updated_at: new Date().toISOString() })
+      .eq("id", campaignContactId);
+    return;
+  }
+
+  // Transparent retry: re-enqueue WITHOUT bumping daily counter.
+  if (TRANSPARENT_RETRY_REASONS.has(failureReason)) {
+    log.info({ failureReason }, "transparent retry — re-enqueue, no bump");
+    await enqueueRetry({ job, retryQueueName, delayMs: 0 });
+    return;
+  }
+
+  // Unknown reasons: be conservative and stop.
+  if (!RETRYABLE_FAILURE_REASONS.has(failureReason)) {
+    log.warn({ failureReason }, "unknown failure_reason, marking needs_attention");
+    await db
+      .from("campaign_contacts")
+      .update({ status: "needs_attention", updated_at: new Date().toISOString() })
+      .eq("id", campaignContactId);
+    return;
+  }
+
+  // Retryable: bump daily_retry_count (DST-correct), enforce cap, schedule.
+  const today = israelTodayIso();
+  const { data: cc } = await db
+    .from("campaign_contacts")
+    .select("daily_retry_count, last_retry_day")
+    .eq("id", campaignContactId)
+    .single();
+
+  let newCount;
+  if (!cc || cc.last_retry_day !== today) {
+    // New Israel day → reset to 1.
+    newCount = 1;
+  } else {
+    newCount = (cc.daily_retry_count || 0) + 1;
+  }
+
+  await db
+    .from("campaign_contacts")
+    .update({
+      daily_retry_count: newCount,
+      last_retry_day: today,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", campaignContactId);
+
+  if (newCount > MAX_DAILY_RETRIES) {
+    log.warn({ newCount, failureReason, metric: "daily_cap_reached" }, "daily_cap_reached");
+    await db
+      .from("campaign_contacts")
+      .update({ status: "needs_attention", updated_at: new Date().toISOString() })
+      .eq("id", campaignContactId);
+    return;
+  }
+
+  // Schedule retry with backoff per current attempt index (newCount-1).
+  const idx = Math.min(newCount - 1, RETRY_BACKOFF_MS.length - 1);
+  const delayMs = RETRY_BACKOFF_MS[idx];
+  log.info(
+    { failureReason, newCount, delayMs },
+    "scheduling retry with backoff",
+  );
+  await enqueueRetry({ job, retryQueueName, delayMs });
+}
+
+/**
+ * Re-enqueue the same call job onto the call-jobs queue with a delay.
+ * Uses a fresh BullMQ Queue handle (cheap — connection pooled by ioredis).
+ */
+async function enqueueRetry({ job, retryQueueName, delayMs }) {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) return;
+  const q = new Queue(retryQueueName, { connection: { url: redisUrl } });
+  try {
+    // Strip the snapshot fields so the next dequeue picks fresh ones.
+    const { agentIdUsed, syncVersionUsed, ...freshData } = job.data;
+    await q.add("call", freshData, { delay: delayMs });
+  } finally {
+    await q.close().catch(() => {});
+  }
+}
+
+/**
+ * Helper for the dequeue-time hard-fail guards (T11.1).
+ * Creates a calls row with failure_reason='agent_not_ready' (DUAL WRITE)
+ * and the snapshotted (possibly null) agent_id_used + sync_version_used.
+ * Does NOT increment daily_retry_count.
+ */
+async function writeAgentNotReadyCall(db, {
+  tenantId,
+  campaignId,
+  contactId,
+  campaignContactId,
+  agentIdUsed,
+  syncVersionUsed,
+  note,
+}) {
+  const nowIso = new Date().toISOString();
+  await db.from("calls").insert({
+    tenant_id: tenantId,
+    campaign_id: campaignId,
+    contact_id: contactId,
+    campaign_contact_id: campaignContactId,
+    status: "failed",
+    started_at: nowIso,
+    ended_at: nowIso,
+    failure_reason: "agent_not_ready",
+    failure_reason_t: "agent_not_ready",
+    agent_id_used: agentIdUsed,
+    sync_version_used: syncVersionUsed,
+  });
 }
 
 // ─── Dead-Letter Handler ────────────────────────────────────────────

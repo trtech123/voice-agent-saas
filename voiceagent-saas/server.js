@@ -20,6 +20,29 @@ import { ariRequest, ensureAriEventSocket, getAriStatus, subscribeToAriEvents } 
 import { registerGatewayMediaSocket } from "./media-bridge.js";
 import { createCallWorker, createMonthlyResetScheduler } from "./call-processor.js";
 import { getActiveBridgeCount, cleanupAllBridges } from "./call-bridge.js";
+import { Queue } from "bullmq";
+import { createClient } from "@supabase/supabase-js";
+import { startLiveTurnWriter, stopLiveTurnWriter } from "./live-turn-writer.js";
+import { startAgentSyncWorker, stopAgentSyncWorker } from "./agent-sync-processor.js";
+import { startAudioArchiveWorker, stopAudioArchiveWorker } from "./audio-archive-processor.js";
+import { startJanitor, stopJanitor } from "./janitor.js";
+
+// ─── Required env validation ──────────────────────────────────────
+// GEMINI_API_KEY is intentionally NOT validated here — Gemini has been
+// removed from the call path, but the env var is kept alive for the 72h
+// rollback window per the Spec A rollout plan.
+const requiredEnv = [
+  "ELEVENLABS_API_KEY",
+  "SUPABASE_DIRECT_DB_URL",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+];
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    console.error(`[boot] missing required env: ${key}`);
+    process.exit(1);
+  }
+}
 
 // ─── Environment ──────────────────────────────────────────────────
 
@@ -605,6 +628,10 @@ fastify.get("/health", async () => {
     ari: getAriStatus(),
     voicenter: getVoicenterStatus(),
     mediaFormat: ASTERISK_MEDIA_FORMAT,
+    liveTurnWriter: auxWorkersStarted ? "ok" : "not_started",
+    agentSyncWorker: auxWorkersStarted ? "ok" : "not_started",
+    audioArchiveWorker: auxWorkersStarted ? "ok" : "not_started",
+    janitor: auxWorkersStarted ? "ok" : "not_started",
   };
 });
 
@@ -703,15 +730,64 @@ const eventLoopMonitorInterval = setInterval(() => {
 
 let worker = null;
 let monthlyResetScheduler = null;
+let supabaseAdmin = null;
+let audioArchiveQueue = null;
+let auxWorkersStarted = false;
 
+// ─── Boot Ordering (LOAD-BEARING) ──────────────────────────────────
+// 1. live-turn-writer BEFORE the call worker — call-bridge calls
+//    enqueueTurn() as soon as a call starts; calling before init silently
+//    no-ops (started guard) and we'd lose transcripts.
+// 2. audio-archive worker BEFORE janitor — janitor re-enqueues into the
+//    audio-archive-jobs queue and the worker must exist to consume them.
+// 3. audioArchiveQueue (producer handle) created after the worker is
+//    listening — conceptually producer-side.
+// 4. call worker LAST so all sinks are ready before any job dispatches.
 if (REDIS_URL) {
+  supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+  );
+  const bullConnection = { url: REDIS_URL };
+
+  // 1. live-turn-writer FIRST
+  startLiveTurnWriter({ logger: fastify.log });
+  fastify.log.info("live-turn-writer started");
+
+  // 2. agent-sync worker
+  startAgentSyncWorker({
+    supabase: supabaseAdmin,
+    connection: bullConnection,
+    logger: fastify.log,
+  });
+
+  // 3. audio-archive worker
+  startAudioArchiveWorker({
+    supabase: supabaseAdmin,
+    connection: bullConnection,
+    logger: fastify.log,
+  });
+
+  // 4. producer-side queue handle for the janitor
+  audioArchiveQueue = new Queue("audio-archive-jobs", { connection: bullConnection });
+
+  // 5. janitor
+  startJanitor({
+    supabase: supabaseAdmin,
+    audioArchiveQueue,
+    logger: fastify.log,
+  });
+
+  auxWorkersStarted = true;
+
+  // 6. call worker (existing)
   worker = createCallWorker(5, {
     gatewayApi: { initiateCall, getCallState },
     log: fastify.log,
   });
 
   monthlyResetScheduler = createMonthlyResetScheduler();
-  fastify.log.info("BullMQ call worker and monthly reset scheduler started");
+  fastify.log.info("BullMQ call worker, aux workers, and monthly reset scheduler started");
 } else {
   fastify.log.warn("REDIS_URL not set — BullMQ worker disabled (gateway-only mode)");
 }
@@ -758,6 +834,22 @@ async function shutdown(signal) {
   if (remaining > 0) {
     fastify.log.warn({ remaining }, "Force-cleaning remaining call bridges");
     cleanupAllBridges();
+  }
+
+  // ─── Aux subsystem shutdown (LOAD-BEARING, reverse of boot) ──────
+  // a. agent-sync + audio-archive workers stop (drain their in-flight jobs)
+  // b. janitor timer stops (no new sweeps)
+  // c. audioArchiveQueue producer handle closes
+  // d. live-turn-writer LAST — must run after all bridges had a chance to
+  //    flushAndClose(callId), otherwise final turns spill to disk.
+  if (auxWorkersStarted) {
+    try { await stopAgentSyncWorker(); } catch (err) { fastify.log.error({ err }, "stopAgentSyncWorker failed"); }
+    try { await stopAudioArchiveWorker(); } catch (err) { fastify.log.error({ err }, "stopAudioArchiveWorker failed"); }
+    try { await stopJanitor(); } catch (err) { fastify.log.error({ err }, "stopJanitor failed"); }
+    if (audioArchiveQueue) {
+      try { await audioArchiveQueue.close(); } catch (err) { fastify.log.error({ err }, "audioArchiveQueue.close failed"); }
+    }
+    try { await stopLiveTurnWriter(); } catch (err) { fastify.log.error({ err }, "stopLiveTurnWriter failed"); }
   }
 
   // 4. Stop event loop monitor

@@ -1,57 +1,29 @@
 // voiceagent-saas/call-bridge.js
 
 /**
- * Call Bridge — Audio bridge between Asterisk (slin16) and Gemini Live AI.
+ * Call Bridge — Audio bridge between Asterisk (slin16) and ElevenLabs
+ * Conversational AI.
  *
- * Ported from apps/voice-engine/src/call-bridge.ts for merged deployment.
+ * Spec: docs/superpowers/specs/2026-04-07-elevenlabs-runtime-swap-design.md §4.4
+ * Plan: docs/superpowers/plans/2026-04-07-elevenlabs-runtime-swap-plan.md (T12)
  *
- * Carried over from FlyingCarpet:
- * - NO_INTERRUPTION mode (prevents Gemini deaf session bug)
- * - Two-tiered watchdog: Track 1 (deaf detection), Track 2 (idle nudge)
- * - Watchdog reconnect with conversation history replay (max 2 reconnects)
- * - Half-duplex audio management (suppress caller during agent speech)
- * - Server-side hallucination detection + correction injection (max 1 per call)
- * - VAD reset silence injection on gate lift
+ * Lifecycle per call (§4.4):
+ *  1. Read agent_id_used / sync_version_used from job payload (snapshotted by
+ *     call-processor at dequeue per T11).
+ *  2. CAS assertion against current campaigns row — if drifted, hang up with
+ *     failure_reason='agent_version_mismatch' (no retry bump).
+ *  3. Open ExternalMedia (already wired by media-bridge), construct
+ *     ElevenLabsSession, pipe audio in/out, route transcripts to
+ *     live-turn-writer, dispatch tool_call events through tools.executeToolCall.
+ *  4. StasisEnd / cleanup ALWAYS finalizes — invariant from §4.4 / §4.8 janitor.
  *
- * Changes from TS version:
- * - handleCallerAudio accepts raw Buffer (slin16 PCM16 16kHz from Asterisk)
- * - handleGeminiAudio uses downsample24kTo16k instead of geminiPcmToUlaw
- * - sendToAsterisk callback (set by media-bridge) replaces voicenterClient.sendAudio
- * - RMS computed on raw Buffer, throttled to every 3rd chunk
- * - All TypeScript types/interfaces/access modifiers removed
- * - Imports from local ./audio-utils.js, ./gemini-session.js, ./tools.js, ./agent-prompt.js
+ * Read-only on campaign_contacts.daily_retry_count — call-processor is the sole
+ * writer per T11.
  */
 
-import { GeminiSession, MAX_GEMINI_RECONNECTS } from "./gemini-session.js";
+import { ElevenLabsSession } from "./elevenlabs-session.js";
+import { enqueueTurn, flushAndClose } from "./live-turn-writer.js";
 import { executeToolCall } from "./tools.js";
-import {
-  computeRms,
-  createSilenceBuffer,
-  SPEECH_RMS_THRESHOLD,
-  slin16ToGeminiPcm,
-  downsample24kTo16k,
-} from "./audio-utils.js";
-import {
-  buildSystemPrompt,
-  buildGreetingInstruction,
-  buildReconnectInstruction,
-  buildIdleNudgeInstruction,
-  buildHallucinationCorrectionInstruction,
-} from "./agent-prompt.js";
-
-// ─── Constants (from FC, configurable via env) ──────────────────────
-
-const HALF_DUPLEX_RELEASE_MS = Number(process.env.GEMINI_HALF_DUPLEX_RELEASE_MS || 200);
-const TOOL_RESPONSE_SUPPRESS_MS = Number(process.env.TOOL_RESPONSE_SUPPRESS_MS || 3000);
-const POST_TOOL_AUDIO_GATE_MAX_MS = Number(process.env.POST_TOOL_AUDIO_GATE_MAX_MS || 10000);
-const POST_GENERATION_PLAYBACK_TAIL_MS = Number(process.env.POST_GENERATION_PLAYBACK_TAIL_MS || 1000);
-const WATCHDOG_SPEECH_DEAF_SEC = Number(process.env.GEMINI_WATCHDOG_SPEECH_DEAF_SEC || 10);
-const WATCHDOG_IDLE_NUDGE_SEC = Number(process.env.GEMINI_WATCHDOG_IDLE_NUDGE_SEC || 25);
-const WATCHDOG_INTERVAL_MS = 2000;
-const MAX_IDLE_NUDGES = 3;
-const VAD_RESET_SILENCE_MS = Number(process.env.GEMINI_VAD_RESET_SILENCE_MS || 300);
-const VAD_RESET_SILENCE_BUF = createSilenceBuffer(VAD_RESET_SILENCE_MS, 16000);
-const CALL_HARD_TIMEOUT_MS = Number(process.env.CALL_HARD_TIMEOUT_MS || 300000); // 5 min
 
 // ─── Active Bridge Tracking ─────────────────────────────────────────
 
@@ -74,525 +46,441 @@ export function preRegisterBridge(callId, bridge) {
 }
 
 export function cleanupAllBridges() {
-  for (const [callId, bridge] of activeBridges) {
+  for (const [, bridge] of activeBridges) {
     bridge.endBridge("server_shutdown");
+  }
+}
+
+// ─── Failure Reason Mapping (spec §5.1) ─────────────────────────────
+
+/**
+ * Map ElevenLabsSession error codes to call_failure_reason_t enum values.
+ * Conservative fallback is el_ws_dropped (no dedicated enum value for
+ * protocol_error / audio_format_mismatch).
+ */
+function mapErrorCodeToFailureReason(code) {
+  switch (code) {
+    case "el_ws_connect_failed":
+      return "el_ws_connect_failed";
+    case "el_ws_dropped":
+      return "el_ws_dropped";
+    case "el_ws_protocol_error":
+      return "el_ws_dropped";
+    case "el_audio_format_mismatch":
+      return "el_ws_dropped";
+    case "max_duration_exceeded":
+      return "max_duration_exceeded";
+    default:
+      return "el_ws_dropped";
   }
 }
 
 // ─── Call Bridge Class ──────────────────────────────────────────────
 
 export class CallBridge {
+  /**
+   * @param {object} cfg
+   * @param {string} cfg.callId
+   * @param {string} cfg.tenantId
+   * @param {string} cfg.campaignId
+   * @param {string} cfg.contactId
+   * @param {string} cfg.campaignContactId
+   * @param {string} cfg.agentIdUsed       snapshotted by call-processor
+   * @param {number|string} cfg.syncVersionUsed snapshotted by call-processor
+   * @param {object} cfg.campaign          { id, name, voice_id, ... }
+   * @param {object} cfg.tenant            { id, name, ... }
+   * @param {object} cfg.contact           { id, name, phone, custom_fields }
+   * @param {object} cfg.supabase          service-role supabase-js client
+   * @param {object} cfg.toolContext       passed verbatim to executeToolCall
+   * @param {object} cfg.log               pino-compatible logger
+   */
   constructor(cfg) {
     this.cfg = cfg;
-    this.log = cfg.log.child
+    this.log = cfg.log && cfg.log.child
       ? cfg.log.child({ component: "call-bridge", callId: cfg.callId })
       : cfg.log;
-    this.callStartedAt = Date.now();
 
-    // Callback set by media-bridge to send audio back to Asterisk
+    this.callId = cfg.callId;
+    this.tenantId = cfg.tenantId;
+    this.campaignId = cfg.campaignId;
+    this.supabase = cfg.supabase;
+
+    this.callStartedAt = new Date();
+    this.endedAt = null;
+
+    // Callback set by media-bridge to send slin16 audio back to Asterisk.
     this.sendToAsterisk = null;
 
-    // Half-duplex state (from FC)
-    this.geminiSpeaking = false;
-    this.protectedAssistantTurnActive = false;
-    this.protectedAssistantTurnCount = 0;
-    this.suppressCallerAudioUntil = 0;
-    this.postToolOutputGateUntil = 0;
-    this.audioWasGated = false;
-
-    // Audio counters
-    this.inboundAudioChunkCount = 0;
-    this.outboundAudioChunkCount = 0;
-    this.suppressedInboundChunkCount = 0;
-    this.audioChunksSentInCurrentTurn = 0;
-    this.rmsCheckCounter = 0; // throttle RMS to every 3rd chunk
-
-    // Transcript
-    this.conversationTranscriptParts = [];
-    this.currentTurnTranscript = "";
-
-    // Watchdog state (two-tiered, from FC)
-    this.watchdogTimer = null;
-    this.speechMsSinceLastOutput = 0;
-    this.lastSpeechChunkAt = 0;
-    this.silentGapMs = 0;
-    this.lastTurnCompleteAt = 0;
-    this.idleNudgeSent = false;
-    this.idleNudgeCount = 0;
-
-    // Reconnect state
-    this.geminiReconnectCount = 0;
-    this.reconnectInProgress = false;
-    this.lastToolResponsePayload = null;
-
-    // Hallucination detection
-    this.correctionInjectionsUsed = 0;
-    this.correctionCheckedThisTurn = false;
-    this.lastToolCallCompletedAtTurn = 0;
-
-    // Tool call state
-    this.toolCallActive = false;
-
-    // Lifecycle
-    this.hasSentGreeting = false;
+    // Lifecycle / state
+    this.session = null;
     this.callEndedResolve = null;
     this.endReason = "unknown";
-    this.toolCallEndCall = false;
-    this.hardTimeoutTimer = null;
-    this.recordingChunks = [];
+    this.failureReason = null;
+    this.finalized = false;
+    this.elWsOpenedAt = null;
+    this.elWsOpenMs = null;
+    this.ttsFirstByteMs = null;
+    this.firstAudioReceivedAt = null;
 
-    // Build dynamic system prompt
-    const systemPrompt = buildSystemPrompt(
-      cfg.campaign,
-      cfg.tenant,
-      cfg.contact
-    );
-
-    // Create Gemini session with event handlers
-    this.gemini = new GeminiSession(
-      { systemPrompt },
-      {
-        onSetupComplete: () => this.handleGeminiReady(),
-        onAudio: (data, mime) => this.handleGeminiAudio(data, mime),
-        onInputTranscription: (text) => this.handleInputTranscription(text),
-        onOutputTranscription: (text) => this.handleOutputTranscription(text),
-        onTurnComplete: () => this.handleTurnComplete(),
-        onGenerationComplete: () => this.handleGenerationComplete(),
-        onInterrupted: () => this.handleInterrupted(),
-        onToolCall: (calls) => this.handleToolCalls(calls),
-        onError: (error) => this.handleGeminiError(error),
-        onClose: (code, reason) => this.handleGeminiClose(code, reason),
-      },
-      this.log
-    );
+    // Metrics
+    this.turnCount = 0;
+    this.toolCallCount = 0;
+    this.inboundAudioChunks = 0;
+    this.outboundAudioChunks = 0;
   }
 
   /**
    * Start the call bridge. Returns a promise that resolves when the call ends.
    */
   async start() {
-    activeBridges.set(this.cfg.callId, this);
+    activeBridges.set(this.callId, this);
 
     return new Promise((resolve) => {
       this.callEndedResolve = resolve;
-
-      // Hard timeout — 5 minutes max per call
-      this.hardTimeoutTimer = setTimeout(() => {
-        this.log.warn("Hard timeout reached (5 min), forcing call cleanup");
-        this.endBridge("hard_timeout");
-      }, CALL_HARD_TIMEOUT_MS);
-
-      // Start Gemini session
-      this.gemini.connect();
-
-      // Start watchdog
-      this.startWatchdog();
+      // Run async setup; if it fails it will finalize and resolve.
+      this._startAsync().catch((err) => {
+        this.log && this.log.error && this.log.error({ err }, "call bridge _startAsync threw");
+        this._finalizeAndResolve("startup_error", "el_ws_connect_failed");
+      });
     });
   }
 
-  // ─── Asterisk -> Bridge Handlers ──────────────────────────────────
+  async _startAsync() {
+    // ── Step 1: CAS assertion against current campaigns row ──────
+    // Defense-in-depth: call-processor already snapshotted these values
+    // at dequeue time, but a deploy / agent-sync race could still drift
+    // before we open the EL WS. We hang up cleanly with
+    // agent_version_mismatch (no retry bump per T11.3).
+    const agentIdUsed = this.cfg.agentIdUsed;
+    const syncVersionUsed = this.cfg.syncVersionUsed;
+
+    if (!agentIdUsed || syncVersionUsed == null) {
+      this.log.warn(
+        { agentIdUsed, syncVersionUsed },
+        "call-bridge missing agent snapshot in cfg — defense-in-depth fail",
+      );
+      await this._finalizeAndResolve("missing_agent_snapshot", "agent_not_ready");
+      return;
+    }
+
+    let campaignRow = null;
+    try {
+      const { data, error } = await this.supabase
+        .from("campaigns")
+        .select("elevenlabs_agent_id, sync_version, agent_status")
+        .eq("id", this.campaignId)
+        .single();
+      if (error) throw error;
+      campaignRow = data;
+    } catch (err) {
+      this.log.error({ err }, "call-bridge campaign CAS lookup failed");
+      await this._finalizeAndResolve("cas_lookup_failed", "network_error");
+      return;
+    }
+
+    if (
+      campaignRow.elevenlabs_agent_id !== agentIdUsed ||
+      String(campaignRow.sync_version) !== String(syncVersionUsed) ||
+      campaignRow.agent_status !== "ready"
+    ) {
+      this.log.warn(
+        {
+          want_agent: agentIdUsed,
+          have_agent: campaignRow.elevenlabs_agent_id,
+          want_sv: syncVersionUsed,
+          have_sv: campaignRow.sync_version,
+          status: campaignRow.agent_status,
+        },
+        "call-bridge agent version mismatch — hanging up",
+      );
+      await this._finalizeAndResolve("agent_version_mismatch", "agent_version_mismatch");
+      return;
+    }
+
+    // ── Step 2: Build EL session ──────────────────────────────────
+    const dynamicVariables = {
+      contact_name: this.cfg.contact?.name || "",
+      business_name: this.cfg.tenant?.name || "",
+      ...(this.cfg.contact?.custom_fields || {}),
+    };
+
+    let session;
+    try {
+      session = new ElevenLabsSession({
+        agentId: agentIdUsed,
+        conversationConfig: {
+          dynamicVariables,
+          // first_message override only if campaign provides one
+          ...(this.cfg.campaign?.first_message
+            ? { firstMessage: this.cfg.campaign.first_message }
+            : {}),
+        },
+        logger: this.log.child
+          ? this.log.child({ component: "el-session", agentId: agentIdUsed })
+          : this.log,
+      });
+    } catch (err) {
+      this.log.error({ err }, "ElevenLabsSession constructor threw");
+      await this._finalizeAndResolve("el_construct_failed", "el_ws_connect_failed");
+      return;
+    }
+
+    this.session = session;
+    this._wireSessionEvents(session);
+
+    // ── Step 3: Open the WS ──────────────────────────────────────
+    this.elWsOpenedAt = Date.now();
+    try {
+      await session.connect();
+    } catch (err) {
+      // ElevenLabsSession.connect throws on construct failure; the 'error'
+      // event handler we wired above will also fire and finalize. Guard so
+      // we don't double-finalize here.
+      this.log.error({ err }, "ElevenLabsSession.connect threw");
+      if (!this.finalized) {
+        await this._finalizeAndResolve("el_connect_failed", "el_ws_connect_failed");
+      }
+    }
+  }
+
+  _wireSessionEvents(session) {
+    session.on("conversation_id", async (conversationId) => {
+      this.elWsOpenMs = Date.now() - this.elWsOpenedAt;
+      this.log.info({ conversationId, elWsOpenMs: this.elWsOpenMs }, "EL conversation_id received");
+      try {
+        await this.supabase
+          .from("calls")
+          .update({ elevenlabs_conversation_id: conversationId })
+          .eq("id", this.callId);
+      } catch (err) {
+        this.log.error({ err }, "failed to persist elevenlabs_conversation_id");
+      }
+    });
+
+    session.on("agent_audio", (buffer) => {
+      this.outboundAudioChunks += 1;
+      if (!this.firstAudioReceivedAt) {
+        this.firstAudioReceivedAt = Date.now();
+        this.ttsFirstByteMs = this.firstAudioReceivedAt - this.elWsOpenedAt;
+      }
+      // EL audio is already PCM16 LE @ 16 kHz (assertion enforced inside the
+      // session). slin16 expects exactly the same — no resampling.
+      if (this.sendToAsterisk) {
+        try {
+          this.sendToAsterisk(buffer.toString("base64"));
+        } catch (err) {
+          this.log.error({ err }, "sendToAsterisk threw");
+        }
+      }
+    });
+
+    session.on("user_transcript", ({ text, isFinal, ts }) => {
+      this.turnCount += 1;
+      enqueueTurn({
+        callId: this.callId,
+        tenantId: this.tenantId,
+        role: "user",
+        text,
+        isFinal,
+        ts,
+      });
+    });
+
+    session.on("agent_response", ({ text, ts }) => {
+      this.turnCount += 1;
+      enqueueTurn({
+        callId: this.callId,
+        tenantId: this.tenantId,
+        role: "agent",
+        text,
+        isFinal: true,
+        ts,
+      });
+    });
+
+    session.on("agent_response_correction", ({ text, ts }) => {
+      // live-turn-writer is append-only; treat correction as another final agent turn.
+      this.turnCount += 1;
+      enqueueTurn({
+        callId: this.callId,
+        tenantId: this.tenantId,
+        role: "agent",
+        text,
+        isFinal: true,
+        ts,
+      });
+    });
+
+    session.on("tool_call", async ({ name, args, callId: toolCallId, reply }) => {
+      this.toolCallCount += 1;
+      this.log.info({ tool: name, toolCallId }, "EL tool_call received");
+      try {
+        const result = await executeToolCall(name, args, this.cfg.toolContext);
+        reply({
+          result: typeof result === "string" ? result : JSON.stringify(result ?? null),
+          isError: false,
+        });
+        // end_call tool: allow agent's farewell to play, then close session.
+        if (name === "end_call" || (result && result.call_ended)) {
+          setTimeout(() => {
+            if (!this.finalized) this.endBridge("tool_end_call");
+          }, 8000);
+        }
+      } catch (err) {
+        this.log.error({ err, name, args }, "tool execution threw");
+        reply({
+          result: err && err.message ? err.message : String(err),
+          isError: true,
+        });
+      }
+    });
+
+    session.on("error", async (err) => {
+      const code = (err && err.code) || "el_ws_protocol_error";
+      const reason = mapErrorCodeToFailureReason(code);
+      this.log.error({ err, code, reason }, "EL session error");
+      if (!this.finalized) {
+        await this._finalizeAndResolve("el_session_error", reason);
+      }
+    });
+
+    session.on("closed", ({ reason }) => {
+      this.log.info({ reason }, "EL session closed event");
+      // StasisEnd will handle finalization if not already done; do not
+      // double-finalize here. The cleanup() / endBridge() path is the
+      // single source of truth for the calls row write.
+    });
+  }
+
+  // ─── Asterisk -> Bridge ────────────────────────────────────────
 
   /**
    * Handle incoming caller audio from Asterisk via media-bridge.
-   * @param {Buffer} audioBuffer - Raw slin16 PCM16 16kHz buffer from Asterisk
+   * @param {Buffer} audioBuffer slin16 PCM16 16kHz buffer
    */
   handleCallerAudio(audioBuffer) {
-    if (!this.gemini.isReady || !this.gemini.isOpen) return;
-
-    const now = Date.now();
-
-    // Half-duplex gating — suppress caller audio during agent speech
-    if (
-      this.protectedAssistantTurnActive ||
-      now < this.suppressCallerAudioUntil ||
-      now < this.postToolOutputGateUntil
-    ) {
-      this.suppressedInboundChunkCount += 1;
-      this.audioWasGated = true;
-      return;
+    if (!this.session) return;
+    if (this.finalized) return;
+    this.inboundAudioChunks += 1;
+    try {
+      this.session.sendAudio(audioBuffer);
+    } catch (err) {
+      this.log.error({ err }, "session.sendAudio threw");
     }
+  }
 
-    // VAD reset silence injection on gate lift
-    if (this.audioWasGated) {
-      this.audioWasGated = false;
-      this.gemini.sendAudio(
-        VAD_RESET_SILENCE_BUF.toString("base64"),
-        "audio/pcm;rate=16000"
-      );
-    }
+  // ─── Bridge Lifecycle ───────────────────────────────────────────
 
-    this.inboundAudioChunkCount += 1;
+  /**
+   * Internal end+resolve. Idempotent. Always finalizes the calls row,
+   * writes call_metrics, and drains live-turn-writer for this call.
+   */
+  async _finalizeAndResolve(endReason, failureReason) {
+    if (this.finalized) return;
+    this.finalized = true;
+    this.endReason = endReason;
+    this.failureReason = failureReason || null;
+    this.endedAt = new Date();
 
-    // RMS-based speech detection for watchdog — throttled to every 3rd chunk
-    this.rmsCheckCounter += 1;
-    if (this.rmsCheckCounter >= 3) {
-      this.rmsCheckCounter = 0;
-      const rms = computeRms(audioBuffer);
-      if (rms >= SPEECH_RMS_THRESHOLD) {
-        const elapsed = this.lastSpeechChunkAt > 0
-          ? Math.min(now - this.lastSpeechChunkAt, 30)
-          : 20;
-        this.speechMsSinceLastOutput += elapsed;
-        this.lastSpeechChunkAt = now;
-        this.silentGapMs = 0;
-        this.lastTurnCompleteAt = 0; // Caller is speaking, not idle
-      } else {
-        this.silentGapMs += this.lastSpeechChunkAt > 0
-          ? Math.min(now - this.lastSpeechChunkAt, 30)
-          : 20;
-        this.lastSpeechChunkAt = now;
-        if (this.silentGapMs > 600) {
-          this.speechMsSinceLastOutput = 0;
-        }
+    // Close EL session if still open
+    if (this.session) {
+      try {
+        await this.session.close(endReason);
+      } catch (err) {
+        this.log.error({ err }, "session.close threw during finalize");
       }
     }
 
-    // Convert slin16 buffer to base64, apply gain for Gemini
-    const base64 = slin16ToGeminiPcm(audioBuffer.toString("base64"));
+    activeBridges.delete(this.callId);
 
-    // Forward to Gemini
-    this.gemini.sendAudio(base64, "audio/pcm;rate=16000");
-  }
-
-  // ─── Gemini -> Bridge Handlers ─────────────────────────────────────
-
-  handleGeminiReady() {
-    this.log.info("Gemini session ready");
-
-    // If this is the first connection, send greeting
-    if (!this.hasSentGreeting) {
-      this.hasSentGreeting = true;
-      this.beginProtectedAssistantTurn("greeting_prompt");
-
-      const greetingInstruction = buildGreetingInstruction(
-        this.cfg.tenant.name,
-        this.cfg.contactName
-      );
-      this.gemini.sendText(greetingInstruction);
+    // Persist final state to calls row + call_metrics + drain turns.
+    try {
+      await this._persistFinalState();
+    } catch (err) {
+      this.log.error({ err }, "persistFinalState threw");
     }
-  }
-
-  handleGeminiAudio(audioBase64, mimeType) {
-    this.postToolOutputGateUntil = 0;
-    this.beginProtectedAssistantTurn("assistant_audio");
-    this.geminiSpeaking = true;
-    this.outboundAudioChunkCount += 1;
-    this.audioChunksSentInCurrentTurn += 1;
-    this.speechMsSinceLastOutput = 0;
-    this.silentGapMs = 0;
-    this.lastSpeechChunkAt = 0;
-
-    // Store for recording
-    this.recordingChunks.push(Buffer.from(audioBase64, "base64"));
-
-    // Downsample Gemini PCM16 24kHz → 16kHz for Asterisk slin16
-    const downsampledBase64 = downsample24kTo16k(audioBase64);
-
-    // Send via callback set by media-bridge
-    if (this.sendToAsterisk) {
-      this.sendToAsterisk(downsampledBase64);
-    }
-  }
-
-  handleInputTranscription(text) {
-    const lastPart = this.conversationTranscriptParts[this.conversationTranscriptParts.length - 1];
-    if (lastPart?.role === "user") {
-      lastPart.text += text;
-    } else {
-      this.conversationTranscriptParts.push({ role: "user", text });
-    }
-  }
-
-  handleOutputTranscription(text) {
-    this.currentTurnTranscript += text;
-    const lastPart = this.conversationTranscriptParts[this.conversationTranscriptParts.length - 1];
-    if (lastPart?.role === "model") {
-      lastPart.text += text;
-    } else {
-      this.conversationTranscriptParts.push({ role: "model", text });
-    }
-  }
-
-  handleTurnComplete() {
-    this.geminiSpeaking = false;
-
-    // Hallucination detection — check if Gemini spoke about prices without a tool call
-    // Only for non-greeting turns, and only once per call
-    if (
-      !this.correctionCheckedThisTurn &&
-      this.currentTurnTranscript.length > 0 &&
-      this.lastToolCallCompletedAtTurn === 0 &&
-      this.protectedAssistantTurnCount > 1 &&
-      this.correctionInjectionsUsed === 0
-    ) {
-      this.correctionCheckedThisTurn = true;
-      const priceKeywords = ["\u05D3\u05D5\u05DC\u05E8", "\u05E9\u05E7\u05DC", "\u05D9\u05D5\u05E8\u05D5", "\u05DE\u05D7\u05D9\u05E8", "\u05DC\u05D0\u05D3\u05DD", "\u20AA", "$"];
-      const hasPrice = priceKeywords.some((kw) => this.currentTurnTranscript.includes(kw));
-
-      if (hasPrice) {
-        this.correctionInjectionsUsed += 1;
-        this.log.warn(
-          { transcriptSnippet: this.currentTurnTranscript.slice(0, 200) },
-          "Hallucination correction — agent mentioned prices without tool call"
-        );
-        this.gemini.sendText(buildHallucinationCorrectionInstruction());
-      }
-    }
-
-    this.endProtectedAssistantTurn("turn_complete");
-    this.lastTurnCompleteAt = Date.now();
-    this.audioChunksSentInCurrentTurn = 0;
-    this.speechMsSinceLastOutput = 0;
-    this.silentGapMs = 0;
-    this.lastSpeechChunkAt = 0;
-    this.idleNudgeSent = false;
-    this.currentTurnTranscript = "";
-    this.correctionCheckedThisTurn = false;
-
-    this.log.info(
-      { inbound: this.inboundAudioChunkCount, outbound: this.outboundAudioChunkCount },
-      "Gemini turn complete"
-    );
-  }
-
-  handleGenerationComplete() {
-    this.geminiSpeaking = false;
-    // End half-duplex on generation complete for reply turns (not greeting)
-    if (this.protectedAssistantTurnActive && this.protectedAssistantTurnCount > 1) {
-      this.endProtectedAssistantTurn("generation_complete");
-    }
-  }
-
-  handleInterrupted() {
-    this.geminiSpeaking = false;
-    this.endProtectedAssistantTurn("generation_interrupted");
-  }
-
-  async handleToolCalls(calls) {
-    this.toolCallActive = true;
-    this.suppressCallerAudioUntil = Date.now() + 30000; // Suppress during tool execution
-
-    const responses = [];
-
-    for (const call of calls) {
-      this.log.info({ toolName: call.name }, "Executing tool call");
-
-      const result = await executeToolCall(
-        call.name,
-        call.args,
-        this.cfg.toolContext
-      );
-
-      responses.push({
-        name: call.name,
-        id: call.id,
-        response: result,
-      });
-
-      // Check if end_call was invoked
-      if (call.name === "end_call" && result.call_ended) {
-        this.toolCallEndCall = true;
-      }
-    }
-
-    // Send tool responses back to Gemini
-    const payloadObj = { toolResponse: { functionResponses: responses } };
-    this.lastToolResponsePayload = payloadObj;
-    this.gemini.sendToolResponse(responses);
-
-    this.toolCallActive = false;
-    this.speechMsSinceLastOutput = 0;
-    this.silentGapMs = 0;
-    this.lastSpeechChunkAt = 0;
-    this.lastToolCallCompletedAtTurn = this.protectedAssistantTurnCount;
-
-    const now = Date.now();
-    this.suppressCallerAudioUntil = now + TOOL_RESPONSE_SUPPRESS_MS;
-    this.postToolOutputGateUntil = now + POST_TOOL_AUDIO_GATE_MAX_MS;
-
-    // If end_call was called, allow the farewell to play then end
-    if (this.toolCallEndCall) {
-      setTimeout(() => {
-        this.endBridge("tool_end_call");
-      }, 8000); // Allow 8s for farewell audio
-    }
-  }
-
-  handleGeminiError(error) {
-    this.log.error({ error }, "Gemini session error");
-    if (this.protectedAssistantTurnActive) {
-      this.endProtectedAssistantTurn("gemini_error");
-    }
-  }
-
-  handleGeminiClose(code, reason) {
-    if (this.protectedAssistantTurnActive) {
-      this.endProtectedAssistantTurn("gemini_ws_closed");
-    }
-
-    const isAbnormal = code !== 1000 && this.gemini.isReady;
-    if (isAbnormal && this.geminiReconnectCount < MAX_GEMINI_RECONNECTS) {
-      this.log.warn(
-        { code, reason, attempt: this.geminiReconnectCount + 1 },
-        "Gemini closed abnormally, attempting reconnect"
-      );
-      this.attemptReconnect();
-    } else if (isAbnormal) {
-      this.log.error({ code, reason }, "Gemini closed, max reconnects exceeded");
-      this.endBridge("gemini_max_reconnects");
-    }
-  }
-
-  // ─── Half-Duplex Gating (from FC) ────────────────────────────────
-
-  beginProtectedAssistantTurn(reason) {
-    if (this.protectedAssistantTurnActive) return;
-    this.protectedAssistantTurnActive = true;
-    this.suppressCallerAudioUntil = 0;
-    this.protectedAssistantTurnCount += 1;
-    this.currentTurnTranscript = "";
-    this.correctionCheckedThisTurn = false;
-  }
-
-  endProtectedAssistantTurn(reason) {
-    if (!this.protectedAssistantTurnActive) return;
-    this.protectedAssistantTurnActive = false;
-    const playbackTailMs =
-      reason === "generation_complete" && this.protectedAssistantTurnCount > 1
-        ? POST_GENERATION_PLAYBACK_TAIL_MS
-        : HALF_DUPLEX_RELEASE_MS;
-    this.suppressCallerAudioUntil = Date.now() + playbackTailMs;
-  }
-
-  // ─── Watchdog (two-tiered, from FC) ──────────────────────────────
-
-  startWatchdog() {
-    this.watchdogTimer = setInterval(() => {
-      if (!this.gemini.isReady || !this.gemini.isOpen) return;
-      if (this.reconnectInProgress) return;
-      if (this.protectedAssistantTurnActive || this.toolCallActive) return;
-
-      // Track 1: Bug Catcher — active speech, no Gemini response
-      const speechSeconds = this.speechMsSinceLastOutput / 1000;
-      if (speechSeconds >= WATCHDOG_SPEECH_DEAF_SEC) {
-        this.log.warn(
-          { speechSeconds: Math.round(speechSeconds) },
-          "Watchdog Track 1: caller speaking but Gemini deaf, reconnecting"
-        );
-        this.attemptReconnect();
-        return;
-      }
-
-      // Track 2: Idle Nudge — silence after turnComplete
-      if (
-        this.lastTurnCompleteAt > 0 &&
-        !this.idleNudgeSent &&
-        this.idleNudgeCount < MAX_IDLE_NUDGES &&
-        !this.geminiSpeaking
-      ) {
-        const idleSec = (Date.now() - this.lastTurnCompleteAt) / 1000;
-        if (idleSec >= WATCHDOG_IDLE_NUDGE_SEC) {
-          this.idleNudgeSent = true;
-          this.idleNudgeCount += 1;
-          this.log.info(
-            { idleSec: Math.round(idleSec), idleNudgeCount: this.idleNudgeCount },
-            "Watchdog Track 2: idle nudge"
-          );
-          this.gemini.sendText(buildIdleNudgeInstruction());
-        }
-      }
-    }, WATCHDOG_INTERVAL_MS);
-  }
-
-  // ─── Reconnect (from FC) ─────────────────────────────────────────
-
-  attemptReconnect() {
-    if (this.reconnectInProgress) return;
-
-    this.geminiReconnectCount += 1;
-    if (this.geminiReconnectCount > MAX_GEMINI_RECONNECTS) {
-      this.log.error("Max Gemini reconnects exceeded, ending bridge");
-      this.endBridge("gemini_max_reconnects");
-      return;
-    }
-
-    this.reconnectInProgress = true;
-    this.geminiSpeaking = false;
-    this.protectedAssistantTurnActive = false;
-    this.suppressCallerAudioUntil = Date.now() + 30000;
-    this.postToolOutputGateUntil = 0;
-    this.toolCallActive = false;
-    this.currentTurnTranscript = "";
-    this.correctionCheckedThisTurn = false;
-    this.correctionInjectionsUsed = 0;
-    this.lastToolCallCompletedAtTurn = 0;
-    this.audioChunksSentInCurrentTurn = 0;
-    this.speechMsSinceLastOutput = 0;
-    this.silentGapMs = 0;
-    this.lastSpeechChunkAt = 0;
-    this.lastTurnCompleteAt = 0;
-    this.idleNudgeSent = false;
-
-    const reconnectInstruction = buildReconnectInstruction(
-      this.cfg.tenant.name,
-      this.cfg.contactName
-    );
-
-    this.gemini.reconnect(
-      this.conversationTranscriptParts,
-      this.lastToolResponsePayload,
-      reconnectInstruction
-    );
-
-    this.reconnectInProgress = false;
-  }
-
-  // ─── Bridge Lifecycle ─────────────────────────────────────────────
-
-  endBridge(reason) {
-    if (!this.callEndedResolve) return; // Already ended
-
-    this.endReason = reason;
-    this.log.info(
-      {
-        reason,
-        durationMs: Date.now() - this.callStartedAt,
-        inbound: this.inboundAudioChunkCount,
-        outbound: this.outboundAudioChunkCount,
-        reconnects: this.geminiReconnectCount,
-        transcriptParts: this.conversationTranscriptParts.length,
-      },
-      "Call bridge ending"
-    );
-
-    // Cleanup
-    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
-    if (this.hardTimeoutTimer) clearTimeout(this.hardTimeoutTimer);
-    this.gemini.close();
-    activeBridges.delete(this.cfg.callId);
-
-    // Build recording buffer
-    const recordingBuffer = this.recordingChunks.length > 0
-      ? Buffer.concat(this.recordingChunks)
-      : null;
 
     const result = {
-      duration_seconds: Math.round((Date.now() - this.callStartedAt) / 1000),
-      transcript: this.conversationTranscriptParts,
-      recordingBuffer,
-      endReason: reason,
-      toolCallEndCall: this.toolCallEndCall,
+      duration_seconds: Math.max(
+        0,
+        Math.floor((this.endedAt - this.callStartedAt) / 1000),
+      ),
+      transcript: [], // canonical transcript lives in call_turns now
+      recordingBuffer: null, // EL webhook + audio-archive-processor own recordings
+      endReason: this.endReason,
+      failureReason: this.failureReason,
+      toolCallEndCall: endReason === "tool_end_call",
     };
 
     const resolve = this.callEndedResolve;
     this.callEndedResolve = null;
-    resolve(result);
+    if (resolve) resolve(result);
+  }
+
+  async _persistFinalState() {
+    const endedIso = this.endedAt.toISOString();
+
+    // DUAL WRITE both failure_reason columns (legacy text + new enum) per
+    // T12.4 / spec §3 — old code paths still read failure_reason.
+    const update = { ended_at: endedIso };
+    if (this.failureReason) {
+      update.failure_reason = this.failureReason;
+      update.failure_reason_t = this.failureReason;
+    }
+    try {
+      await this.supabase.from("calls").update(update).eq("id", this.callId);
+    } catch (err) {
+      this.log.error({ err }, "calls update on finalize failed");
+    }
+
+    // call_metrics: PRIMARY KEY insert, ignore duplicate (StasisEnd may race
+    // with the janitor — both should be safe).
+    const metricsRow = {
+      call_id: this.callId,
+      tenant_id: this.tenantId,
+      call_duration_seconds: Math.max(
+        0,
+        Math.floor((this.endedAt - this.callStartedAt) / 1000),
+      ),
+      transcript_turn_count: this.turnCount,
+      tool_call_count: this.toolCallCount,
+      tts_first_byte_ms: this.ttsFirstByteMs,
+      el_ws_open_ms: this.elWsOpenMs,
+    };
+    try {
+      await this.supabase
+        .from("call_metrics")
+        .upsert(metricsRow, { onConflict: "call_id", ignoreDuplicates: true });
+    } catch (err) {
+      this.log.error({ err }, "call_metrics upsert failed");
+    }
+
+    // Drain live-turn-writer buffer for this call.
+    try {
+      await flushAndClose(this.callId);
+    } catch (err) {
+      this.log.error({ err }, "flushAndClose failed");
+    }
   }
 
   /**
-   * External cleanup entry point — called by media-bridge on Asterisk disconnect.
+   * Public end entry point.
+   */
+  endBridge(reason) {
+    if (this.finalized) return;
+    // Detached promise — do not block Asterisk event loop.
+    this._finalizeAndResolve(reason, this.failureReason).catch((err) => {
+      this.log && this.log.error && this.log.error({ err }, "endBridge finalize threw");
+    });
+  }
+
+  /**
+   * External cleanup entry point — called by media-bridge on Asterisk
+   * disconnect / StasisEnd. ALWAYS finalizes (§4.4 invariant + §4.8 janitor
+   * second line of defense), even if EL session never opened.
    */
   cleanup() {
+    if (this.finalized) return;
     this.endBridge("asterisk_disconnect");
   }
 }
