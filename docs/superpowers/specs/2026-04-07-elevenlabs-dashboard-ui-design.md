@@ -74,7 +74,7 @@ Reused without modification:
 - The actual save (write to `campaigns.voice_id`) happens when the parent form is saved → triggers Spec A's `agent-sync-jobs` flow
 
 **Persisted UX state:**
-- "Last previewed voice" stored in localStorage so the user can A/B quickly across modal sessions
+- "Last previewed voice" stored in localStorage under key `last-previewed-voice:{tenantId}` (scoped per tenant to avoid leaks on shared devices) so the user can A/B quickly across modal sessions
 
 **Accessibility:**
 - Modal traps focus, ESC closes
@@ -109,6 +109,8 @@ Each non-bundled card expands to show:
 3. On success: encrypt via `packages/database` helper (verified real per Spec A §3.1), store as `tenants.llm_api_key_encrypted`, set `last4` and `validated_at`, return success
 4. On failure: do NOT store; return error message; surface in red banner
 
+The `validateLlmKey` server action is rate-limited to 1 call per minute per tenant to prevent burning provider tokens on rapid retries. Show a "נסה שוב בעוד X שניות" message if throttled.
+
 > **Why validate before encrypting:** the original spec encrypted bad keys silently → support nightmare. Now an invalid key never reaches the database.
 
 **Default state:** every tenant starts on `bundled`. They can opt out.
@@ -121,7 +123,7 @@ Each non-bundled card expands to show:
 
 | `agent_status` | Pill copy | Color | Behavior |
 |---|---|---|---|
-| `pending` | "ממתין לסנכרון" | gray | No action; auto-transitions when agent-sync job runs |
+| `pending` | "ממתין לסנכרון" | gray | The pill is passive (no click handler), but the Quick Call button below it can manually trigger sync. Auto-transitions when agent-sync job runs. |
 | `provisioning` | "מסנכרן…" | blue, with spinner | No action; polls or Realtime-subscribes |
 | `ready` | "מוכן" | green | Quick Call enabled |
 | `failed` | "סנכרון נכשל" | red | **Inline error banner appears below pill, NOT a hover tooltip** |
@@ -143,6 +145,8 @@ Each non-bundled card expands to show:
 
 **Realtime subscription:** the pill subscribes to Supabase Realtime on `campaigns` row updates filtered by `campaign_id` so transitions are instant. Fallback: 5-second poll if Realtime channel is unhealthy.
 
+**Realtime health detection (applies here and in §3.4):** Realtime is considered unhealthy when no server message (data, presence, or heartbeat) has been received for 15 seconds. On detection, fall back to polling on a 5-second interval. Attempt to re-establish the Realtime channel with exponential backoff (1s, 2s, 4s, capped at 30s). When re-established, drop the poll.
+
 ### 3.4 Live transcript page
 
 **Route:** `apps/dashboard/app/(dashboard)/campaigns/[id]/calls/[callId]/live/page.tsx`
@@ -151,13 +155,13 @@ Each non-bundled card expands to show:
 
 | State | When | UI |
 |---|---|---|
-| `dialing` | Call enqueued, no `started_at` yet | Centered spinner + "מחייג…" + cancel button (hangs up the call) |
+| `dialing` | Call enqueued, no `started_at` yet | Centered spinner + "מחייג…" + cancel button (hangs up the call). If the user clicks Cancel before Asterisk has originated the channel (no `started_at` yet), the `cancelLiveCall` server action removes the BullMQ job if still pending; if already started, sends an ARI hangup. Both paths are idempotent — clicking Cancel twice is safe. |
 | `ringing` | `calls.status='ringing'` | "מצלצל…" + cancel button |
 | `connected` | `started_at` set, no turns yet | "מחובר. ממתין לדיבור…" + a thin "live" indicator pulse |
 | `in_conversation` | At least one turn in `call_turns` | Transcript bubbles, auto-scroll, "live" pulse |
 | `ended_awaiting_analysis` | `ended_at` set, `webhook_processed_at` null | Transcript frozen + banner: "השיחה הסתיימה. מנתחים…" with skeleton for summary |
 | `analysis_ready` | `webhook_processed_at` set | Banner replaced with link "צפה בסיכום השיחה" → post-call view (§3.5) |
-| `failed_to_connect` | `failure_reason` set before any turn | Error card with reason + retry button |
+| `failed_to_connect` | `failure_reason` set before any turn | Error card with reason + retry button. The retry button calls `retryFailedCall(contactId, idempotencyKey)` from §4 (same flow as the Failed Calls tab), with the same confirm dialog and 5-second optimistic disable. No bypass. |
 | `disconnected_mid_call` | `failure_reason='el_ws_dropped'` after turns exist | Transcript preserved + warning banner "השיחה התנתקה" |
 
 **Transcript bubbles (RTL-correct):**
@@ -173,7 +177,7 @@ Each non-bundled card expands to show:
 **Realtime subscription:**
 - Supabase Realtime channel filtered by `call_id`
 - Listens to `INSERT` on `call_turns` and `UPDATE` on `calls` (for state transitions)
-- Reconnect with exponential backoff on disconnect
+- Reconnect with exponential backoff on disconnect (see §3.3 Realtime health detection — same 15s heartbeat rule, 5s poll fallback, 1/2/4/…/30s reconnect backoff)
 - "החיבור אבד, מנסה שוב…" banner shown during reconnect attempts
 - On unmount: explicit channel cleanup
 
@@ -195,15 +199,19 @@ Each non-bundled card expands to show:
 1. **Summary card** — `calls.summary`, sentiment badge, success_evaluation badge, call duration, contact name
 2. **Audio player** — extended `audio-player.tsx` with time scrubber, play/pause, current time / duration. Source = signed URL fetched on-demand from Supabase Storage via server action `getCallRecordingUrl(callId)`. Lazy-loaded.
 3. **Transcript** — read from `transcript_full` (canonical). If `webhook_processed_at IS NULL`, show "מנתחים את השיחה…" banner and read from `call_turns` as a temporary preview, with a clear `<aside>` note: "תמלול ראשוני, ייתכנו שינויים".
-4. **Tool call timeline** — collapsed by default. Reads from `call_tool_invocations`. Each entry: tool name (Hebrew label from a `toolLabels` map), args (collapsible JSON), result/error, latency_ms badge.
+4. **Tool call timeline** — collapsed by default. Reads from `call_tool_invocations`. Each entry: tool name (Hebrew label from a `toolLabels` map), args (collapsible JSON), result/error, latency_ms badge. Tool labels live in `apps/dashboard/src/i18n/he.ts` under `tools.{toolName}.label` and are loaded by the timeline component. New tools require adding a label entry.
 5. **Audio archive status** — small indicator: "ההקלטה נשמרה" / "שומרים את ההקלטה…" / "שמירת הקלטה נכשלה" with admin retry button.
 
 **Audio player extensions to `audio-player.tsx` (minimal):**
-- Add a `<input type="range">` time scrubber
-- Add play/pause toggle
-- Add current time / duration display
-- Keep the existing API; new props are additive
-- No waveform visualization in v1 (deferred)
+
+> Note: scrubber, play/pause, and current-time/duration display already exist in `audio-player.tsx` today. The real gaps are listed below.
+
+- **Error state for expired signed URLs:** when the underlying `<audio>` element errors (e.g., 403 from an expired signed URL), show an inline banner "השמעת ההקלטה נכשלה, נסה שוב" with a retry button that re-invokes `getCallRecordingUrl(callId)` to fetch a fresh signed URL and reloads the source.
+- **Lazy fetch:** set `preload="none"` on the `<audio>` element so the browser does not download the recording until the user clicks play. The signed URL itself is also generated on-demand (not at page load).
+- **Shared "stop others on play" coordination:** extract a tiny shared `useExclusiveAudio()` hook (e.g., `apps/dashboard/src/hooks/use-exclusive-audio.ts`) used by both the §3.1 voice picker preview AND this audio player so only one audio element plays at a time across the page. Hook registers each audio element on mount and pauses all others when one starts playing.
+- **Loading skeleton:** while the signed URL is being generated by `getCallRecordingUrl`, render a skeleton placeholder in place of the player controls.
+- Keep the existing API; new props are additive.
+- No waveform visualization in v1 (deferred).
 
 **Realtime subscription on `calls` row:** picks up `webhook_processed_at` flipping from null → timestamp so the page upgrades from "analyzing" to "ready" without a manual refresh.
 
@@ -216,7 +224,7 @@ Each non-bundled card expands to show:
 **Additions:**
 - **Filters:** by `failure_reason` (multi-select), by date range (default last 7 days), by contact name search
 - **Pagination:** 25 per page, server-side cursor pagination
-- **Bulk actions:** select-all checkbox + "נסה שוב את הנבחרים" button (max 50 at a time)
+- **Bulk actions:** select-all checkbox + "נסה שוב את הנבחרים" button (max 50 at a time). During bulk retry, show an inline progress indicator (`X / Y נשלחו`) with a stop button that aborts remaining enqueues. Do not block the page.
 - **Per-row retry safety:**
   - Confirm dialog: "לנסות שוב לחייג ל-<contact>? פעולה זו תאפס את מונה הניסיונות היומי."
   - On confirm: server action `retryFailedCall(contactId, idempotencyKey)` where `idempotencyKey` is generated client-side per click
@@ -226,6 +234,8 @@ Each non-bundled card expands to show:
 - **Loading skeleton:** rows skeleton during fetch
 
 ## 4. Server actions / API surface
+
+> **Error contract:** All server actions return `{ ok: true, data } | { ok: false, error: { code, message } }`. Error codes are namespaced (e.g., `ELEVENLABS_VALIDATION_FAILED`, `LLM_KEY_INVALID`, `RATE_LIMITED`). Components surface `error.message` directly to users (already in Hebrew via the validating action).
 
 | Server action | Purpose | Auth |
 |---|---|---|
@@ -246,7 +256,25 @@ All server actions enforce tenant scoping via the existing auth middleware. None
 
 - All new components use `dir="rtl"` at the appropriate container level
 - Mixed-direction text (Hebrew + English brand names): `dir="auto"` on text spans
-- All copy stored in a Hebrew strings file `apps/dashboard/src/i18n/he.ts` — no inline English strings in components
+- All copy stored in a Hebrew strings file `apps/dashboard/src/i18n/he.ts` — no inline string literals allowed in components. The file is namespaced by feature; all keys must be added to `he.ts` before component implementation. Concrete contract:
+
+```ts
+// apps/dashboard/src/i18n/he.ts
+export const he = {
+  campaigns: {
+    voicePicker: { title: 'בחירת קול', searchPlaceholder: '...', preview: 'השמע', select: 'בחר' },
+    statusPill: { pending: 'ממתין לסנכרון', provisioning: 'מסנכרן…', ready: 'מוכן', failed: 'סנכרון נכשל' },
+    quickCall: { ready: 'התקשר עכשיו', provisioning: 'מסנכרן את הסוכן…', pending: 'ממתין לסנכרון', failed: 'תקן הגדרות' },
+  },
+  liveCall: { dialing: 'מחייג…', ringing: 'מצלצל…', connected: 'מחובר. ממתין לדיבור…', /* ... */ },
+  // ... namespaced by feature
+} as const
+
+// Interpolation rule for mixed-direction sentences:
+// Use ICU MessageFormat-style {placeholder} and wrap interpolated values
+// (especially names) in <span dir="auto">{value}</span> at render time.
+```
+
 - Mobile breakpoints: tested at 360px, 414px, 768px, 1024px
 - Touch targets ≥44px
 - Voice picker modal is full-screen on mobile, centered on desktop
@@ -280,17 +308,18 @@ All server actions enforce tenant scoping via the existing auth middleware. None
 
 **Hard prerequisite:** Spec A in production for ≥72 hours, metrics green.
 
-**Step 1 — Feature flag**
-- New env var `NEXT_PUBLIC_FEATURE_ELEVENLABS_UI=true`
-- All new UI gated behind the flag
-- Default `false` until ready for staged rollout
+**Step 1 — Feature flag (DB-backed, per-tenant)**
+- Per-tenant flag stored on `tenants.feature_flags jsonb default '{}'::jsonb`, key `elevenlabs_ui` (boolean). Runtime-toggled, no redeploy needed for staged rollout.
+- All new UI gated behind `tenants.feature_flags->>'elevenlabs_ui' = 'true'`
+- Default off (absent key = false) until ready for staged rollout
+- **Cross-spec coordination:** This requires Spec A's migration to also add `tenants.feature_flags jsonb default '{}'::jsonb` — coordinate before merging.
 
 **Step 2 — Deploy to Railway**
 - Push to main → Railway auto-deploys
 - Flag still false → no user visible change
 
 **Step 3 — Smoke test on a single tenant**
-- Toggle flag for one internal test tenant via Supabase row
+- Toggle the per-tenant flag for one internal test tenant via Supabase row (`update tenants set feature_flags = feature_flags || '{"elevenlabs_ui":true}'::jsonb where id = …`)
 - Run Playwright E2E in production (it's idempotent)
 - Manually click through every state on a real iPhone
 
@@ -302,7 +331,7 @@ All server actions enforce tenant scoping via the existing auth middleware. None
 **Step 5 — Remove the flag**
 - After 1 week at 100%, delete the flag and the gating code
 
-**Rollback:** flip the flag to false. Code stays deployed. Zero database changes (Spec A owns the schema).
+**Rollback:** flip the per-tenant flag to false (or null out the key) for affected tenants. Code stays deployed. Zero database changes beyond the `feature_flags` column added via Spec A's migration.
 
 ## 8. Out of scope (explicit follow-up specs)
 

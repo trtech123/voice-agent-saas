@@ -52,13 +52,14 @@ Asterisk ARI originate → Voicenter SIP → phone
 ExternalMedia (slin16, 16 kHz PCM) — unchanged
         │
         ▼
-call-bridge.js (rewritten, slimmer)
+call-bridge.js (rewritten, slimmer — one instance per call)
   ├── elevenlabs-session.js   (NEW, replaces gemini-session.js)
   ├── elevenlabs-tools-adapter.js (NEW — keeps tools.js provider-clean)
-  ├── live-turn-writer.js     (NEW, shared singleton across all calls)
   ├── tools.js                (unchanged implementations)
   ├── compliance.js           (unchanged)
   └── whatsapp-client.js      (unchanged)
+
+live-turn-writer.js  (NEW, process-wide singleton — peer of call-bridge.js, shared across all calls)
 
 Dashboard webhook endpoint (NEW, backend-only in this spec):
   POST /api/webhooks/elevenlabs/conversation-ended
@@ -131,8 +132,8 @@ This spec owns the **entire** migration. Spec B does not add columns.
 | `retry_count` | int, default 0 | Increment per retry; max 3/day enforced via `last_retry_day` |
 | `last_retry_day` | date, nullable | DST-correct: `(now() at time zone 'Asia/Jerusalem')::date` at write time |
 | `webhook_processed_at` | timestamptz, nullable | Idempotency key for webhook handler; UPDATE...WHERE webhook_processed_at IS NULL |
-| `started_at` | timestamptz, nullable | If not already present in current schema, add it |
-| `ended_at` | timestamptz, nullable | If not already present, add it |
+| `started_at` | timestamptz, nullable | Migration MUST `ADD COLUMN IF NOT EXISTS started_at timestamptz` (deterministic; no schema-inspection conditional) |
+| `ended_at` | timestamptz, nullable | Migration MUST `ADD COLUMN IF NOT EXISTS ended_at timestamptz` (deterministic; no schema-inspection conditional) |
 | `agent_id_used` | text, nullable | Snapshot of `campaigns.elevenlabs_agent_id` at call enqueue time (TOCTOU guard) |
 | `sync_version_used` | bigint, nullable | Snapshot of `campaigns.sync_version` at call enqueue time |
 
@@ -149,7 +150,7 @@ This spec owns the **entire** migration. Spec B does not add columns.
 create table call_turns (
   id          uuid primary key default gen_random_uuid(),
   call_id     uuid not null references calls(id) on delete cascade,
-  tenant_id   uuid not null references tenants(id),
+  tenant_id   uuid not null references tenants(id),  -- denormalized for RLS; ON DELETE CASCADE only on call_id FK
   turn_index  bigint not null,
   role        text not null check (role in ('user', 'agent')),
   text        text not null,
@@ -182,8 +183,10 @@ create table call_tool_invocations (
   ended_at    timestamptz,
   latency_ms  int generated always as (
                 extract(epoch from (ended_at - started_at)) * 1000
-              ) stored
+              ) stored,
+  unique (call_id, name, started_at)
 );
+-- generated latency_ms is safe: webhook handler (canonical writer, see §4.6) supplies both timestamps from the EL payload in the same insert.
 
 create index on call_tool_invocations (tenant_id, name, started_at desc);
 create index on call_tool_invocations (call_id);
@@ -204,10 +207,13 @@ create table webhook_events (
   signature     text,
   received_at   timestamptz not null default now(),
   processed_at  timestamptz,
-  processing_error text
+  processing_error text,
+  check (octet_length(raw_body::text) <= 262144)  -- belt-and-suspenders cap; primary 256 KB rejection happens at the route, see §4.6 step 0
 );
 create index on webhook_events (source, external_id);
 create index on webhook_events (received_at desc) where processed_at is null;
+-- Cheap "have we processed this EL conversation already?" lookup. Purely additive; does not interact with insert-before-verify logic.
+create unique index on webhook_events (source, external_id) where external_id is not null;
 ```
 
 Logs every EL webhook hit raw, before any processing. Lifesaver when EL changes payload shapes. Retention: 30 days (cleaned by janitor).
@@ -226,7 +232,7 @@ insert into platform_settings (key, value) values
   ('default_tts_model', '"eleven_turbo_v2_5"'::jsonb);
 ```
 
-Defaults for `campaigns.voice_id` and `campaigns.tts_model` are sourced from this table at row insert time (via a `BEFORE INSERT` trigger or app-layer fetch on campaign create — picked at implementation time). Swappable without code deploy.
+Defaults for `campaigns.voice_id` and `campaigns.tts_model` are sourced from this table at row insert time via a `BEFORE INSERT` trigger on `campaigns` that fills `voice_id` and `tts_model` from `platform_settings` if NULL. App-layer fetch is rejected because it can be bypassed by future code paths. Swappable without code deploy.
 
 ### New Postgres enum types
 
@@ -238,7 +244,8 @@ create type call_failure_reason_t   as enum (
   'voicenter_busy', 'el_ws_connect_failed', 'el_ws_dropped',
   'agent_not_ready', 'agent_version_mismatch',
   'no_answer', 'network_error', 'dnc_listed',
-  'invalid_number', 'compliance_block', 'abandoned_by_callee', 'janitor_finalized'
+  'invalid_number', 'compliance_block', 'abandoned_by_callee', 'janitor_finalized',
+  'webhook_timeout', 'el_quota_exceeded'
 );
 ```
 
@@ -260,11 +267,21 @@ create type call_failure_reason_t   as enum (
 
 Single SQL migration: `supabase/migrations/2026-04-07_elevenlabs_runtime_swap.sql`. New columns are nullable / safe-defaulted. Enums and tables created idempotently with `if not exists` where supported.
 
+#### 3.2 Migration ordering inside the SQL file
+
+`campaigns.voice_id` and `campaigns.tts_model` are declared `not null`, but a `BEFORE INSERT` trigger does NOT fire on `ALTER TABLE`, so existing rows would violate `NOT NULL` if added directly. The SQL file MUST, in a single transaction:
+
+1. `ADD COLUMN voice_id text` (nullable) and `ADD COLUMN tts_model text` (nullable).
+2. Backfill both columns on existing rows from `platform_settings` (`default_voice_id`, `default_tts_model`).
+3. `ALTER COLUMN ... SET NOT NULL` on both columns.
+4. Create the `BEFORE INSERT` trigger so subsequent inserts auto-fill.
+
 ### 3.1 Encryption verification gate (BLOCKING — must pass before code starts)
 
-The original spec assumed `packages/database` already has a real encryption helper for `llm_api_key_encrypted`. Backend reviewer flagged this. Before implementation, **verify**:
+The original spec assumed `packages/database` already has a real encryption helper for `llm_api_key_encrypted`. Backend reviewer flagged this. Before implementation, **verify** (placeholder path: `packages/database/src/encryption.ts` — verify this file exists and is real, replace with actual path if different):
 - The existing helper uses pgsodium / Supabase Vault / KMS envelope encryption — NOT app-layer AES with a static env secret.
 - If it does not exist or is insufficient, the implementation plan must include building it (likely pgsodium-based) as a prerequisite step, blocking everything else.
+- **Owner of verification:** backend lead (see §6.2 Step 0 acceptance criteria).
 
 ## 4. Component Design
 
@@ -302,10 +319,13 @@ class ElevenLabsSession extends EventEmitter {
 - Audio in/out: PCM 16k base64
 - Heartbeat: ping/pong every 20s
 - No reconnect — fail-fast per design
+- **Max-call-duration kill switch:** hard 10-minute timer per session. On expiry, close the WS, finalize the `calls` row with `failure_reason='janitor_finalized'` (or a dedicated reason if added later), and emit a metric. Defense-in-depth ahead of janitor's 15-minute sweep.
 
 ### 4.2 `agent-sync-processor.js` (NEW, race-safe)
 
 **Purpose:** Reconcile a `campaigns` row to an EL agent without race conditions.
+
+**Origin:** Agent-sync REST API calls originate from the **droplet worker, never the dashboard.** The droplet holds `ELEVENLABS_API_KEY`; the dashboard does not need it.
 
 **Race-safety mechanism (CAS via `sync_version`):**
 1. Job pickup. Read `(sync_version, agent_status, external_ref, el_etag, prompt, voice_id, ...)` from `campaigns`.
@@ -323,12 +343,12 @@ class ElevenLabsSession extends EventEmitter {
 
 ### 4.3 `live-turn-writer.js` (NEW, shared singleton)
 
-**Purpose:** Cross-call batched inserts to `call_turns` and `call_tool_invocations` from a single shared `postgres-js` pool, not per-call PostgREST.
+**Purpose:** Cross-call batched inserts to `call_turns` from a single shared `postgres-js` pool, not per-call PostgREST. **`call_tool_invocations` is NOT written here** — it is written ONLY by the webhook handler (canonical, see §4.6 step 6). The live writer's sole table is `call_turns`.
 
 **Behavior:**
 - One module-level singleton, initialized at process boot
 - One shared `postgres-js` connection pool (size 10) against Supabase Postgres direct connection — NOT PostgREST
-- In-memory queue keyed by `call_id` with `{ turns: [], tools: [], lastFlushAt }`
+- In-memory queue keyed by `call_id` with `{ turns: [], lastFlushAt }` (no tools — see purpose above)
 - Flush trigger: 500 ms timer (was 200 ms — backend reviewer adjusted) OR ≥20 turns buffered for any call OR `final` flag OR `flushAndClose(callId)` from call-bridge
 - **Cross-call batching:** every 500 ms tick, flush ALL pending calls' turns in a single multi-row insert
 - **Monotonic turn_index:** assigned by the writer from an in-memory counter per call_id at the moment a turn is enqueued, NEVER from EL event ordering. Guarantees no reorder.
@@ -336,13 +356,21 @@ class ElevenLabsSession extends EventEmitter {
 
 **Why 500 ms not 200 ms:** at 100 concurrent calls, 200 ms flushes = 500 writes/sec sustained, burns Supabase connection slots. 500 ms cross-call batched halves the rate and Realtime propagation is ~100–300 ms anyway, invisible to users.
 
+#### 4.3.1 postgres-js connection pool sizing
+
+- **Pool size:** 10 per droplet.
+- **Target:** Supavisor in **transaction mode** (NOT session mode) — required so the small pool can multiplex across many concurrent flushes.
+- **Connection string env var:** `SUPABASE_DIRECT_DB_URL` (separate from the PostgREST/anon URL used by the dashboard).
+- **Pool exhausted behavior:** flush stalls but never blocks the call audio path — the in-memory buffer queue absorbs the delay, and the webhook is the canonical source for transcripts anyway.
+- **Max queue depth:** if any call's buffered turns exceed 500 entries, drop new turns to a disk-log fallback (`/var/log/voiceagent-saas/turn-fallback.jsonl`) and log a `queue_overflow` warning. Webhook reconciliation will fill the gap.
+
 ### 4.4 `call-bridge.js` (rewritten, slimmer, TOCTOU-safe)
 
 **Purpose:** Wire Asterisk media stream ↔ EL session ↔ live writer ↔ tool dispatcher.
 
 **Lifecycle per call:**
 1. Receive `StasisStart` from ARI.
-2. Read `agent_id_used` and `sync_version_used` from the **call job payload** (snapshotted at enqueue time, NOT looked up now). **No TOCTOU.**
+2. Read `agent_id_used` and `sync_version_used` from the **call job payload** (snapshotted at enqueue time, NOT looked up now). **No TOCTOU.** Before step 4, `call-processor` refreshes the snapshot from `campaigns` one final time **at dequeue** (not enqueue) to shrink the deploy-race window.
 3. Refetch `campaigns` row; assert `elevenlabs_agent_id == agent_id_used && sync_version == sync_version_used && agent_status='ready'`. If mismatched, hang up with `failure_reason='agent_version_mismatch'`. No retry (the new version will be tried on next scheduled call).
 4. Open ExternalMedia channel (slin16, 16 kHz).
 5. Construct `ElevenLabsSession` with `agentId`, dynamic vars (contact_name, business_name, custom fields).
@@ -373,7 +401,8 @@ module.exports = { buildElevenLabsClientTools }
 **Route:** `apps/dashboard/app/api/webhooks/elevenlabs/conversation-ended/route.ts`
 
 **Handler steps:**
-1. Read raw body. **First**, insert into `webhook_events` (raw payload, signature, headers). This happens before any verification so we have a forensic record even of forged attempts.
+0. **Pre-checks (no DB writes).** Reject `Content-Length > 256 KB` with HTTP 413. Require the EL timestamp header to be present; reject HTTP 400 if missing. These run before step 1 to keep the DoS surface small.
+1. Read raw body. **First**, insert into `webhook_events` (raw payload, signature, headers). This happens before any verification so we have a forensic record even of forged attempts. (The `webhook_events.raw_body` size constraint in §3 is a belt-and-suspenders cap.)
 2. Verify HMAC-SHA256 with `ELEVENLABS_WEBHOOK_SECRET`. **Verify timestamp header within 5-minute skew**. On failure → `processing_error='invalid_signature'`, return 401.
 3. Parse `conversation_id`, `transcript`, `analysis`, `audio_url`, `duration_seconds`, `tool_calls`.
 4. Look up `calls` row by `elevenlabs_conversation_id`. If missing → `processing_error='no_matching_call'`, return 200 (idempotent no-op, no EL retry storm).
@@ -389,7 +418,7 @@ module.exports = { buildElevenLabsClientTools }
     ```
    - If 0 rows affected → already processed, return 200.
    - If 1 row affected → continue.
-6. **Insert tool invocations** into `call_tool_invocations` (idempotent on `(call_id, started_at, name)` — skip duplicates).
+6. **Insert tool invocations** into `call_tool_invocations`. The webhook handler is the **canonical and only writer** for this table (live-turn-writer does not touch it — see §4.3). Idempotency is enforced by the `UNIQUE (call_id, name, started_at)` constraint declared in §3 via `INSERT ... ON CONFLICT DO NOTHING`.
 7. **Enqueue audio archive job**: `audio-archive-jobs.add({ callId, signedUrl: audio_url }, { jobId: "audio:${callId}" })`. Audio download happens async — webhook stays fast.
 8. Update `webhook_events.processed_at = now()`.
 9. Return 200.
@@ -417,8 +446,9 @@ module.exports = { buildElevenLabsClientTools }
 
 **Behavior:**
 - Periodic timer (every 60s)
-- Find `calls` where `started_at < now() - interval '15 minutes' AND ended_at IS NULL`
+- Find `calls` where `started_at < now() - interval '15 minutes' AND ended_at IS NULL`. The SELECT MUST use `FOR UPDATE SKIP LOCKED` to be safe under janitor scale-out (multiple droplets / multiple janitor instances).
 - For each: set `ended_at=now()`, `failure_reason='janitor_finalized'`, emit `call_metric` row, log warning
+- **Orphaned audio-archive sweep:** also find `calls` where `audio_archive_status='pending' AND webhook_processed_at < now() - interval '10 minutes'` (also `FOR UPDATE SKIP LOCKED`) and re-enqueue the `audio-archive-jobs` job. This recovers from the case where the webhook handler committed the row but the BullMQ enqueue failed (Redis blip between commit and enqueue).
 - Also cleans `webhook_events` older than 30 days
 
 ## 5. Error Handling, Retries & Observability
@@ -429,7 +459,8 @@ module.exports = { buildElevenLabsClientTools }
 |---|---|---|---|
 | EL agent create fails (4xx) | agent-sync-processor | n/a (campaign-level) | 3× exp backoff → `agent_status='failed'` |
 | EL agent create fails (5xx/network) | agent-sync-processor | n/a | Same |
-| Call attempted with `agent_status != 'ready'` | call-processor | `agent_not_ready` | No |
+| Call attempted with `agent_status != 'ready'` | call-processor | `agent_not_ready` | Yes (timing — sync will resolve; auto-delay) |
+| live-turn-writer postgres pool exhausted | live-turn-writer | n/a | Log + queue depth metric; turn drops to disk-log fallback; never blocks call |
 | Call payload `sync_version` doesn't match current | call-bridge | `agent_version_mismatch` | No (stale snapshot) |
 | EL WS fails to open at call start | call-bridge | `el_ws_connect_failed` | Yes, daily cap |
 | EL WS drops mid-call | call-bridge | `el_ws_dropped` | No |
@@ -460,8 +491,14 @@ Enforced in `call-processor.js`, per `campaign_contacts` row:
   ```
 - If returned `daily_retry_count > 3` → `status='needs_attention'`, do not enqueue
 - Backoff: 15 min → 1 h → 4 h
-- Retryable failure reasons: `voicenter_busy`, `el_ws_connect_failed`, `no_answer`, `network_error`
-- Non-retryable (manual only): `dnc_listed`, `agent_not_ready`, `agent_version_mismatch`, `invalid_number`, `compliance_block`
+- Retryable failure reasons: `voicenter_busy`, `el_ws_connect_failed`, `no_answer`, `network_error`, `agent_not_ready` (timing issue, auto-delay until sync completes)
+- Non-retryable (manual only): `dnc_listed`, `invalid_number`, `compliance_block`
+- **Special case — `agent_version_mismatch`:** auto-retried but does **NOT** count toward the daily cap. It's a deploy-race, not a real failure. `call-processor` must skip the `daily_retry_count` increment for this reason.
+
+**Writer ownership for `campaign_contacts.daily_retry_count` and `last_retry_day`:**
+- **Only `call-processor.js` writes** these columns, at enqueue time.
+- `call-bridge.js` is **read-only** on these columns.
+- This avoids dual-writer races.
 
 > **Why this fixes DST:** day boundaries are computed in Israel local time at write time, stored as a `date`, and compared as `date`. Spring-forward 23h day and fall-back 25h day both work correctly because we never compare timestamps, only dates.
 
@@ -486,6 +523,8 @@ create table call_metrics (
 );
 create index on call_metrics (tenant_id, created_at desc);
 ```
+
+`call_metrics.call_id` is `PRIMARY KEY`: written **once at call finalization in `call-bridge.js`'s StasisEnd handler. Not upserted.**
 
 Per-tool latency p95 derived from `call_tool_invocations.latency_ms` GROUP BY `name`. No need for a separate metric table.
 
@@ -540,7 +579,7 @@ Per-tool latency p95 derived from `call_tool_invocations.latency_ms` GROUP BY `n
 - Create `call-recordings` Storage bucket with file size + mime restrictions
 
 **Step 2 — Backfill existing campaigns**
-- One-time script: set `voice_id` and `tts_model` from `platform_settings`, `agent_status='pending'`, `sync_version=0`, `external_ref=gen_random_uuid()`
+- One-time script: set `voice_id` and `tts_model` from `platform_settings`, `agent_status='pending'`, `sync_version=0`. (`external_ref` is omitted from the script — the column has `default gen_random_uuid()` and will populate automatically.)
 - Do NOT auto-create EL agents — wait for user save (which fires sync), or admin "Provision Agents" button (built in Spec B)
 
 **Step 3 — Pre-cutover safety net**
@@ -549,21 +588,22 @@ Per-tool latency p95 derived from `call_tool_invocations.latency_ms` GROUP BY `n
 - Keep `GEMINI_API_KEY` in droplet `.env` and Railway env vars for **72 hours after cutover**
 - Rehearse the rollback once on a staging copy: `git revert <merge>`, redeploy droplet, place a Hebrew test call. **Sign off in writing before proceeding.**
 
-**Step 4 — Deploy voice engine (droplet)**
+**Step 4 — Deploy dashboard (Railway)**
+- Webhook endpoint live (no UI changes — that's Spec B)
+- Call enqueue path snapshots `agent_id_used` + `sync_version_used` into the job payload
+- New env vars: `ELEVENLABS_WEBHOOK_SECRET` only. The dashboard does NOT need `ELEVENLABS_API_KEY` — agent-sync REST originates on the droplet (see §4.2).
+
+**Step 5 — Configure EL webhook**
+- In ElevenLabs dashboard, set conversation-ended webhook URL → dashboard endpoint (now live from Step 4)
+- Copy webhook secret into Railway env vars
+- Send a test webhook from EL dashboard → verify `webhook_events` row
+- **Webhook MUST be configured before the droplet cutover** so the first real EL call has a destination for its post-call payload.
+
+**Step 6 — Deploy voice engine (droplet)**
 - New `elevenlabs-session.js`, `elevenlabs-tools-adapter.js`, `agent-sync-processor.js`, `audio-archive-processor.js`, `live-turn-writer.js`, `janitor.js`
 - Rewritten `call-bridge.js`
 - `gemini-session.js` and `audio-utils.js` deleted in this commit
-- New env vars on droplet: `ELEVENLABS_API_KEY`, `ELEVENLABS_WORKSPACE_ID` (if EL requires), Supabase direct connection string for postgres-js pool
-
-**Step 5 — Deploy dashboard (Railway)**
-- Webhook endpoint live (no UI changes — that's Spec B)
-- Call enqueue path snapshots `agent_id_used` + `sync_version_used` into the job payload
-- New env vars: `ELEVENLABS_API_KEY`, `ELEVENLABS_WEBHOOK_SECRET`
-
-**Step 6 — Configure EL webhook**
-- In ElevenLabs dashboard, set conversation-ended webhook URL → dashboard endpoint
-- Copy webhook secret into Railway env vars
-- Send a test webhook from EL dashboard → verify `webhook_events` row
+- New env vars on droplet: `ELEVENLABS_API_KEY`, `ELEVENLABS_WORKSPACE_ID` (if EL requires), `SUPABASE_DIRECT_DB_URL` for the postgres-js pool (see §4.3.1)
 
 **Step 7 — Smoke test on a single test campaign**
 - Run the manual test plan above before any real customer call
