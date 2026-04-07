@@ -19,7 +19,11 @@ import fastifyWs from "@fastify/websocket";
 import { ariRequest, ensureAriEventSocket, getAriStatus, subscribeToAriEvents } from "./ari-client.js";
 import { registerGatewayMediaSocket } from "./media-bridge.js";
 import { createCallWorker, createMonthlyResetScheduler } from "./call-processor.js";
-import { getActiveBridgeCount, cleanupAllBridges } from "./call-bridge.js";
+import {
+  getActiveBridge,
+  getActiveBridgeCount,
+  cleanupAllBridges,
+} from "./call-bridge.js";
 import { createClient } from "@supabase/supabase-js";
 import { startLiveTurnWriter, stopLiveTurnWriter } from "./live-turn-writer.js";
 import { startAgentSyncWorker, stopAgentSyncWorker } from "./agent-sync-processor.js";
@@ -464,6 +468,30 @@ subscribeToAriEvents(async (event) => {
     } else if (state === "Up") {
       const nextCall = await markCall(call, "connected");
       await sendLifecycleEvent(nextCall, "connected");
+
+      // Signal the CallBridge that the customer has picked up so it can
+      // start the EL conversation (transitions PRE_WARMED → LIVE).
+      // Before this fix, EL's conversation clock started on WS open
+      // during ring, burning turn-timeouts and leaving the agent in a
+      // stale state by the time the customer actually answered.
+      // Spec: docs/superpowers/specs/2026-04-08-el-session-lifecycle-fix-design.md §3.3
+      if (call.callId) {
+        const bridge = getActiveBridge(call.callId);
+        if (bridge && typeof bridge.handleCustomerAnswered === "function") {
+          fastify.log.info(
+            { sipCallId: call.sipCallId, callId: call.callId },
+            "Customer answered — signaling bridge",
+          );
+          try {
+            bridge.handleCustomerAnswered();
+          } catch (err) {
+            fastify.log.error(
+              { err, callId: call.callId },
+              "bridge.handleCustomerAnswered threw",
+            );
+          }
+        }
+      }
     }
     return;
   }
