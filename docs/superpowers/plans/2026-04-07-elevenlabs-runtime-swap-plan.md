@@ -15,19 +15,22 @@
 **Acceptance criteria:**
 - Creates enums `agent_status_t`, `llm_provider_t`, `audio_archive_status_t`, `call_failure_reason_t` (idempotent).
 - Adds all `campaigns`, `tenants`, `calls`, `campaign_contacts` columns per §3. Uses `ADD COLUMN IF NOT EXISTS` for `calls.started_at`/`ended_at` (confirmed already present in `supabase/migrations/001_initial_schema.sql` lines 190-191 — so the IF NOT EXISTS is load-bearing).
-- `campaigns.voice_id` / `tts_model` ordering MUST be: (1) ADD COLUMN nullable → (2) backfill from `platform_settings` → (3) `SET NOT NULL`, all inside one `BEGIN…COMMIT`.
+- `tts_model` ordering MUST be: (1) ADD COLUMN nullable → (2) backfill from `platform_settings.default_tts_model` → (3) `SET NOT NULL`, all inside one `BEGIN…COMMIT`. `voice_id` stays nullable forever (no default per product decision #1).
 - Creates `call_turns`, `call_tool_invocations`, `webhook_events`, `platform_settings`, `call_metrics` per §3 with all indexes, unique constraints, RLS enabled.
+- Adds `tenants.feature_flags jsonb not null default '{}'::jsonb` (consumed by Spec B's per-tenant rollout — folded here so Spec B needs no migration).
+- `campaigns.voice_id` is added but **NOT** seeded with a default; trigger fills `tts_model` only. `voice_id` stays NULL until the user picks one via Spec B's voice picker; Quick Call is blocked while NULL.
+- Adds `max_duration_exceeded` to `call_failure_reason_t` enum (used by `ElevenLabsSession` 10-minute kill switch in T4).
 - `call_tool_invocations.latency_ms` is a stored generated column.
 - `webhook_events` has `CHECK (octet_length(raw_body::text) <= 262144)` and the partial unique index on `(source, external_id) WHERE external_id IS NOT NULL`.
-- Seeds `platform_settings` with vetted Hebrew `voice_id` (placeholder until EL setup) and `eleven_turbo_v2_5`.
-- Creates **`BEFORE INSERT` trigger on `campaigns`** that fills `voice_id`/`tts_model` from `platform_settings` when NULL. **No app-layer fetch fallback.**
+- Seeds `platform_settings` with `default_tts_model='eleven_turbo_v2_5'` only. **No `default_voice_id` seed** (per product decision #1 — user must pick).
+- Creates **`BEFORE INSERT` trigger on `campaigns`** that fills `tts_model` from `platform_settings.default_tts_model` when NULL. **Does NOT fill `voice_id`** — that stays NULL until the user picks via Spec B. **No app-layer fetch fallback.**
 - Creates `call-recordings` Storage bucket (private, 50 MB, `audio/mpeg, audio/mp4`).
 - Non-destructive — rollback-safe.
 
 ### T2 — Backfill script (one-shot)
 **File:** ad-hoc SQL run through Supabase MCP
 **Depends on:** T1
-**Acceptance:** Existing `campaigns` rows get `voice_id`, `tts_model` (from `platform_settings`), `agent_status='pending'`, `sync_version=0`. `external_ref` auto-populated by default. No EL agents created yet.
+**Acceptance:** Existing `campaigns` rows get `tts_model` (from `platform_settings.default_tts_model`), `agent_status='pending'`, `sync_version=0`. `voice_id` stays NULL (user must pick via Spec B before Quick Call works). `external_ref` auto-populated by default. No EL agents created yet. Existing campaigns will show "needs voice" until the user opens the picker — this is intentional and matches Spec B's flow.
 
 ### T3 — New file: `voiceagent-saas/elevenlabs-tools-adapter.js`
 **Depends on:** none (reads `tools.js`)
@@ -37,10 +40,10 @@
 **Depends on:** T3
 **Acceptance criteria:**
 - `class ElevenLabsSession extends EventEmitter` with exact public interface in §4.1.
-- Events: `agent_audio`, `user_transcript`, `agent_response`, `tool_call` (with `reply` fn), `conversation_id`, `error`, `closed`.
-- WS endpoint `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=...`, `xi-api-key` header, `conversation_initiation_client_data` first message, PCM 16k base64, 20s ping/pong, **no reconnect**.
-- **10-minute hard kill switch timer** per session: on expiry, close WS and finalize `calls` row with `failure_reason='janitor_finalized'`, emit metric.
-- Tool results returned ONLY via per-event `reply()` callback (no private-method-from-outside).
+- Implementation follows **Appendix A protocol pinning verbatim** — endpoint, auth header, all client→server / server→client message shapes, audio format assertion.
+- Events emitted: `agent_audio`, `user_transcript`, `agent_response`, `tool_call` (with `reply` fn), `conversation_id`, `error`, `closed`.
+- **10-minute hard kill switch timer** per session: on expiry, emit `error` with reason `max_duration_exceeded`, close WS, call-bridge finalizes the call row with `failure_reason='max_duration_exceeded'` (NOT `janitor_finalized`).
+- Tool results returned ONLY via per-event `reply()` callback. Internal `Map<tool_call_id, replyCallback>` ensures one reply per call; warn if reply is called twice or never (the latter blocks the conversation indefinitely on a "blocking" tool).
 
 ### T5 — New file: `voiceagent-saas/live-turn-writer.js`
 **Depends on:** T1
@@ -133,7 +136,7 @@
 
 Execute on a real Hebrew phone call before marking PR ready. Each is a named gate:
 
-- **G1** Fresh campaign uses default voice from `platform_settings`.
+- **G1** Fresh campaign created with `voice_id=NULL` and Quick Call blocked. Manually set `voice_id` via SQL (Spec A has no UI) — agent provisions on next save/sync.
 - **G2** `agent_status`: pending → provisioning → ready within ~5s.
 - **G3** Own phone added as contact; Quick Call triggers.
 - **G4** 30s Hebrew conversation invokes at least one tool ("אני מעוניין, תקבע לי פגישה").
@@ -155,18 +158,240 @@ Execute on a real Hebrew phone call before marking PR ready. Each is a named gat
 4. **Step 3** Pre-cutover safety net: `git tag pre-elevenlabs`, DO droplet snapshot, keep `GEMINI_API_KEY` for 72h, **rehearse rollback on staging with a real Hebrew call, sign off in writing**.
 5. **Step 4** Deploy dashboard to Railway (webhook endpoint + job-payload snapshot path). Env: `ELEVENLABS_WEBHOOK_SECRET` only.
 6. **Step 5** Configure EL dashboard webhook URL → Railway endpoint; copy secret; send test webhook; verify `webhook_events` row. **MUST happen BEFORE Step 6.**
-7. **Step 6** Deploy voice engine to droplet (scp + `systemctl restart`). New files + rewritten `call-bridge.js` + deletions. Env: `ELEVENLABS_API_KEY`, `ELEVENLABS_WORKSPACE_ID`, `SUPABASE_DIRECT_DB_URL`.
+7. **Step 6** Deploy voice engine to droplet (scp + `systemctl restart`). New files + rewritten `call-bridge.js` + deletions. Env: `ELEVENLABS_API_KEY`, `SUPABASE_DIRECT_DB_URL`. (No `ELEVENLABS_WORKSPACE_ID` — confirmed not required.)
 8. **Step 7** Smoke test on single test campaign — run G1–G13, sign off in writing.
 9. **Step 8** Cutover — real customer calls flow through EL.
 10. **Step 9** 72-hour watch (`tts_first_byte_ms` p95, `el_ws_open_ms` p95, webhook success, `audio_archive_status='failed'` rate, `call_failure_reason_t` distribution). After stable: remove `GEMINI_API_KEY` from droplet + Railway.
 
-## Open questions (require product input before implementation)
+## Resolved decisions (from product)
 
-1. **Vetted Hebrew `voice_id`** — the `platform_settings` seed has a placeholder `<VETTED_HEBREW_VOICE_ID>`. Product must pick one from EL's Hebrew-friendly voices before migration applies (or seed a safe default and update post-hoc via `platform_settings` UPDATE).
-2. **10-minute kill switch failure reason** — Should Spec A add a dedicated `max_duration_exceeded` enum value now, or reuse `janitor_finalized`?
-3. **`ELEVENLABS_WORKSPACE_ID`** — Confirm with live EL docs whether this env var is required.
-4. **EL Conversational AI WebSocket protocol** — Implementer should pull live EL docs before writing `elevenlabs-session.js` to confirm current event shapes/tool payloads.
-5. **Spec B coordination:** `tenants.feature_flags jsonb` — Spec B's rollout depends on this column. Confirm whether to fold into Spec A's migration now (recommended) or as a small follow-up migration when Spec B begins.
+1. **Default voice:** No default. `campaigns.voice_id` is created NULL; Quick Call is blocked until the user picks a voice via Spec B's voice picker (or admin SQL override). The `BEFORE INSERT` trigger only fills `tts_model`, not `voice_id`. **The `platform_settings` seed must NOT seed `default_voice_id`.**
+2. **10-minute kill switch failure reason:** Add `max_duration_exceeded` to the `call_failure_reason_t` enum. Use this (not `janitor_finalized`) when the in-process timer fires.
+3. **`ELEVENLABS_WORKSPACE_ID`:** Not required. ElevenLabs auth is `xi-api-key` header only. Drop from env var lists.
+4. **EL WebSocket protocol:** Pinned in Appendix A below. Implementer follows the appendix; no live doc lookup needed for T4.
+5. **`tenants.feature_flags jsonb`:** Fold into Spec A's migration (T1) so Spec B can ship without a follow-up migration.
+
+## Open questions
+
+None remaining. Ready for implementation.
+
+---
+
+## Appendix A — ElevenLabs Conversational AI WebSocket Protocol (pinned)
+
+Source: ElevenLabs official docs as of 2026-04-07. Implementer of T4 follows this appendix verbatim.
+
+### Endpoint & auth
+
+```
+wss://api.elevenlabs.io/v1/convai/conversation?agent_id=<agent_id>
+Header: xi-api-key: <ELEVENLABS_API_KEY>
+```
+
+### First message (client → server)
+
+`conversation_initiation_client_data` — sent immediately after connection opens.
+
+```json
+{
+  "type": "conversation_initiation_client_data",
+  "conversation_config_override": {
+    "agent": {
+      "prompt": { "prompt": "...", "llm": "gpt-4" },
+      "first_message": "...",
+      "language": "he"
+    },
+    "tts": {
+      "voice_id": "<voice_id>",
+      "speed": 1.0,
+      "stability": 0.5,
+      "similarity_boost": 0.75
+    }
+  },
+  "custom_llm_extra_body": { "temperature": 0.7, "max_tokens": 150 },
+  "dynamic_variables": {
+    "contact_name": "...",
+    "business_name": "...",
+    "...": "..."
+  }
+}
+```
+
+> **Note for T4 + T6:** for Spec A, prompt + voice + tools live on the EL agent itself (created/managed by `agent-sync-processor.js`). The first message in `call-bridge.js` should be minimal — only `dynamic_variables` (contact name, business name, custom fields) and `conversation_config_override.agent.first_message` if needed for personalization. Do NOT override the prompt at call time — it's already on the agent.
+
+### Client → server message types
+
+| `type` | Purpose |
+|---|---|
+| `conversation_initiation_client_data` | First message (above) |
+| `user_audio_chunk` | Base64-encoded PCM 16k audio frame from user |
+| `pong` | Response to server `ping`, echoing `event_id` |
+| `client_tool_result` | Result of an executed client tool |
+| `contextual_update` | Free-form context to inject into conversation state |
+| `user_message` | Text message from user (we don't use — voice only) |
+| `user_activity` | User activity signal (we don't use) |
+
+### Server → client message types
+
+| `type` | Purpose |
+|---|---|
+| `conversation_initiation_metadata` | Sent right after connect; carries `conversation_id` + `agent_output_audio_format` |
+| `audio` | Base64 PCM 16k audio frame from agent |
+| `user_transcript` | User speech transcription (tentative or final) |
+| `agent_response` | Agent's text response (final) |
+| `agent_response_correction` | Corrected response after interruption |
+| `interruption` | Notification an event was interrupted |
+| `client_tool_call` | Request to execute a client tool |
+| `ping` | Latency measurement; echo with `pong` + same `event_id` |
+| `vad_score` | Voice activity detection (0–1); informational |
+| `internal_tentative_agent_response` | Preliminary agent response (informational) |
+| `contextual_update` | Server-side context injection |
+
+### Audio format
+
+- Encoding: base64 PCM signed 16-bit little-endian
+- Sample rate: confirmed via `conversation_initiation_metadata.agent_output_audio_format` field — expect `"pcm_16000"`
+- Direction matches Asterisk slin16. **No resampling needed.**
+
+### Server → client message JSON shapes (verbatim)
+
+**`conversation_initiation_metadata`**
+```json
+{
+  "type": "conversation_initiation_metadata",
+  "conversation_initiation_metadata_event": {
+    "conversation_id": "conv_abc123xyz",
+    "agent_output_audio_format": "pcm_16000"
+  }
+}
+```
+→ T4: emit `conversation_id` event with the string. Assert `agent_output_audio_format === "pcm_16000"`; if not, fail-fast (no resampling code path exists).
+
+**`audio`**
+```json
+{
+  "type": "audio",
+  "audio_event": {
+    "audio_base_64": "<b64 PCM 16k>",
+    "event_id": 123
+  }
+}
+```
+→ T4: decode base64, emit `agent_audio` event with the raw Buffer.
+
+**`user_transcript`**
+```json
+{
+  "type": "user_transcript",
+  "user_transcription_event": {
+    "user_transcript": "Hello, how are you?",
+    "is_final": true
+  }
+}
+```
+→ T4: emit `user_transcript` event with `{ text, isFinal, ts: Date.now() }`. T5 enqueues the row.
+
+**`agent_response`**
+```json
+{
+  "type": "agent_response",
+  "agent_response_event": {
+    "agent_response": "I'm doing well, thank you for asking!"
+  }
+}
+```
+→ T4: emit `agent_response` event with `{ text, isFinal: true, ts: Date.now() }`. T5 enqueues the row.
+
+**`agent_response_correction`** — same shape as `agent_response`. T4 emits as a correction event; T5 may need to overwrite the last agent turn rather than append (decision deferred to T5 implementation, document either way).
+
+**`client_tool_call`**
+```json
+{
+  "type": "client_tool_call",
+  "client_tool_call": {
+    "tool_name": "displayMessage",
+    "tool_call_id": "unique_call_id_123",
+    "parameters": { "text": "Hello from the agent!" }
+  }
+}
+```
+→ T4: emit `tool_call` event with `{ name, args, callId, reply }` where `reply(result)` sends back `client_tool_result` (see below).
+
+**`ping`**
+```json
+{
+  "type": "ping",
+  "ping_event": { "event_id": 456, "ping_ms": 42 }
+}
+```
+→ T4: respond immediately with `pong` carrying same `event_id`. Track `ping_ms` for the `tts_first_byte_ms` metric (or use it for connection health).
+
+**`interruption`** → T4: emit informational `interruption` event; the live writer may need to mark the last agent turn as truncated. Implementation detail for T5.
+
+**`vad_score`** → T4: ignored for v1 (informational only).
+
+### Client → server message JSON shapes
+
+**`conversation_initiation_client_data`** — see "First message" above.
+
+**`user_audio_chunk`**
+```json
+{
+  "type": "user_audio_chunk",
+  "user_audio_chunk": "<b64 PCM 16k>"
+}
+```
+→ T4 `sendAudio(buffer)`: base64-encode the buffer and send.
+
+**`pong`**
+```json
+{
+  "type": "pong",
+  "event_id": 456
+}
+```
+→ T4: sent in response to server `ping` with the matching `event_id`.
+
+**`client_tool_result`**
+```json
+{
+  "type": "client_tool_result",
+  "tool_call_id": "unique_call_id_123",
+  "result": "Message displayed successfully",
+  "is_error": false
+}
+```
+→ T4: the `reply()` callback on `tool_call` events constructs and sends this. On thrown exceptions in `tools.executeTool()`, send with `is_error: true` and `result: <error message>` so the agent can recover the conversation.
+
+### Tool definition (when creating an agent in T6)
+
+When `agent-sync-processor.js` creates the EL agent via REST, the `tools` array must use this shape (one entry per `tools.js` tool):
+
+```json
+{
+  "tool_name": "score_lead",
+  "description": "Score the lead's qualification on a 0-100 scale",
+  "parameters": {
+    "score": { "type": "integer", "description": "0-100" },
+    "reason": { "type": "string", "description": "..." }
+  }
+}
+```
+
+> **Important:** all client tools must be marked as **"blocking conversation"** in the agent config (so the agent waits for the result before continuing). For Spec A's tools (`score_lead`, `book_meeting`, `mark_dnc`, `send_whatsapp`) every one is side-effect-bearing, so all must block. Set this flag in the create-agent payload.
+
+### `elevenlabs-tools-adapter.js` (T3) responsibility
+
+Convert `tools.js` definitions to the EL `tool_name` / `description` / `parameters` shape above. The adapter is the ONLY file that touches this shape; `tools.js` stays vendor-clean.
+
+### Notes for T4 `ElevenLabsSession` implementation
+
+- WebSocket library: `ws` (already in voice engine `package.json`)
+- On connect: send `conversation_initiation_client_data` immediately, do not wait for any server hello
+- On `conversation_initiation_metadata`: emit `conversation_id`, validate audio format
+- 10-minute kill timer starts at connect; on fire, emit `error` with `max_duration_exceeded` reason and close WS
+- 20s heartbeat: rely on server `ping`/`pong` flow above; if no `ping` for 30s, treat as dropped → emit `error`
+- Tool result reply path: keep a small in-memory `Map<tool_call_id, replyCallback>` so reply can be called once per call; warn if reply called twice or never
 
 ## Critical files for implementation
 
