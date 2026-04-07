@@ -61,6 +61,8 @@ export class ElevenLabsSession extends EventEmitter {
     this._lastPingAt = null;          // used by downstream tts_first_byte_ms metric
     /** @type {Map<string, {replied: boolean}>} */
     this._pendingToolCalls = new Map();
+    this._wsOpen = false;
+    this._conversationStarted = false;
   }
 
   /** Open the WebSocket and send the initiation payload. */
@@ -88,7 +90,10 @@ export class ElevenLabsSession extends EventEmitter {
       this.log.info({ agentId: this.agentId }, "ElevenLabs WS open");
       this._startMaxDurationTimer();
       this._resetHeartbeat();
-      this._sendInitiation();
+      this._wsOpen = true;
+      this.emit("ws_open");
+      // Do NOT send conversation_initiation_client_data here.
+      // Caller must invoke startConversation() to start the agent turn.
     });
 
     ws.on("message", (data) => this._handleMessage(data));
@@ -119,6 +124,10 @@ export class ElevenLabsSession extends EventEmitter {
    * @param {Buffer} pcm16kBuffer
    */
   sendAudio(pcm16kBuffer) {
+    if (!this._conversationStarted) {
+      // Pre-conversation (ring window) — silently drop. Expected path.
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.log.warn("sendAudio called while EL WS not open — dropping frame");
       return;
@@ -128,6 +137,26 @@ export class ElevenLabsSession extends EventEmitter {
       type: "user_audio_chunk",
       user_audio_chunk: b64,
     });
+  }
+
+  /**
+   * Begin the EL conversation by sending conversation_initiation_client_data.
+   * MUST be called only after the 'ws_open' event has fired.
+   * Idempotent: a second call logs a warning and no-ops.
+   */
+  startConversation() {
+    if (this._conversationStarted) {
+      this.log.warn("startConversation called twice — ignoring");
+      return;
+    }
+    if (!this._wsOpen) {
+      throw new ElevenLabsSessionError(
+        "startConversation called before ws_open",
+        "el_ws_protocol_error"
+      );
+    }
+    this._conversationStarted = true;
+    this._sendInitiation();
   }
 
   /**

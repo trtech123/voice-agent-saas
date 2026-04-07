@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@fastify/formbody": "^8.0.0",
@@ -17,5 +19,8 @@
     "fastify": "^5.0.0",
     "postgres": "^3.4.4",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0"
   }
 }
