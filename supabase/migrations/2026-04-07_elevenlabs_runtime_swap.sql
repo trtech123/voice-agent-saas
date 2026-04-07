@@ -122,6 +122,36 @@ create trigger campaigns_fill_defaults_trg
   before insert on public.campaigns
   for each row execute function public.campaigns_fill_defaults();
 
+-- BEFORE UPDATE: auto-bump sync_version when user-visible agent-relevant
+-- fields change. Processor writes to agent_status/el_etag/agent_synced_at/
+-- agent_sync_error/elevenlabs_agent_id do NOT bump — prevents CAS ping-pong
+-- between agent-sync-processor and this trigger.
+create or replace function public.campaigns_bump_sync_version()
+returns trigger
+language plpgsql
+as $$
+begin
+  if  new.name                is distinct from old.name
+   or new.script              is distinct from old.script
+   or new.questions           is distinct from old.questions
+   or new.voice_id            is distinct from old.voice_id
+   or new.tts_model           is distinct from old.tts_model
+   or new.whatsapp_followup_template is distinct from old.whatsapp_followup_template
+   or new.whatsapp_followup_link     is distinct from old.whatsapp_followup_link
+  then
+    if new.sync_version is not distinct from old.sync_version then
+      new.sync_version := old.sync_version + 1;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists campaigns_bump_sync_version_trg on public.campaigns;
+create trigger campaigns_bump_sync_version_trg
+  before update on public.campaigns
+  for each row execute function public.campaigns_bump_sync_version();
+
 -- ============================================================
 -- CALLS — new columns (started_at/ended_at already exist per 001)
 -- ============================================================
