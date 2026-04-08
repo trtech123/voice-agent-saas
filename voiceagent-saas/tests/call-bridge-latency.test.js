@@ -196,3 +196,57 @@ describe("latency helpers", () => {
     });
   });
 });
+
+describe("customerAnsweredAt stamping", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+
+  it("stamps customerAnsweredAt on handleCustomerAnswered() from PRE_WARMED", async () => {
+    const { bridge } = makeBridge();
+    bridge.start();
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("ws_open");
+    expect(bridge.latency.customerAnsweredAt).toBe(null);
+
+    const before = Date.now();
+    bridge.handleCustomerAnswered();
+    const after = Date.now();
+
+    expect(bridge.latency.customerAnsweredAt).toBeGreaterThanOrEqual(before);
+    expect(bridge.latency.customerAnsweredAt).toBeLessThanOrEqual(after);
+  });
+
+  it("stamps customerAnsweredAt when called during PRE_WARMING (queued race)", async () => {
+    const { bridge } = makeBridge();
+    bridge.start();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(bridge._state).toBe("pre_warming");
+    expect(bridge.latency.customerAnsweredAt).toBe(null);
+
+    // Customer answered before ws_open.
+    bridge.handleCustomerAnswered();
+    expect(bridge.latency.customerAnsweredAt).not.toBe(null);
+    // State is still pre_warming (queued).
+    expect(bridge._state).toBe("pre_warming");
+
+    // Subsequent ws_open drains the queue into LIVE.
+    MockElevenLabsSession.last.emit("ws_open");
+    expect(bridge._state).toBe("live");
+  });
+
+  it("does not re-stamp customerAnsweredAt on a second call", async () => {
+    const { bridge } = makeBridge();
+    bridge.start();
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("ws_open");
+
+    bridge.handleCustomerAnswered();
+    const first = bridge.latency.customerAnsweredAt;
+    await new Promise((r) => setTimeout(r, 5));
+    bridge.handleCustomerAnswered(); // second call — idempotent, should warn
+
+    expect(bridge.latency.customerAnsweredAt).toBe(first);
+  });
+});

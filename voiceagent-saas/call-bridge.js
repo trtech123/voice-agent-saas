@@ -478,6 +478,14 @@ export class CallBridge {
    * Spec: docs/superpowers/specs/2026-04-08-el-session-lifecycle-fix-design.md §3.2
    */
   handleCustomerAnswered() {
+    // Spec §3.1, §4.2: stamp unconditionally at method entry so that a
+    // call during PRE_WARMING (queued via _pendingCustomerAnswered) still
+    // captures the user's subjective "I answered the phone" moment.
+    // Guarded to not re-stamp on idempotent second calls.
+    if (this.latency.customerAnsweredAt == null) {
+      this.latency.customerAnsweredAt = Date.now();
+    }
+
     if (this._state === "live") {
       this.log.warn("handleCustomerAnswered called twice — ignoring");
       return;
