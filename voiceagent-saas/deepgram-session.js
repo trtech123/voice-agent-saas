@@ -124,14 +124,49 @@ export class DeepgramSession extends EventEmitter {
 
   _handleMessage(data, isBinary) {
     this._lastInboundAt = Date.now();
-    if (isBinary) return; // Deepgram does not send binary
+    this._cancelSilentDegradationWatchdog();
+    if (isBinary) return;
     let msg;
     try {
       msg = JSON.parse(data.toString());
     } catch {
       return;
     }
-    // Filled in by Task 3.
+    const type = msg && msg.type;
+    if (type === "Results") {
+      const alt = msg.channel?.alternatives?.[0];
+      if (!alt) return;
+      const text = alt.transcript || "";
+      if (!text) return;
+      const confidence = typeof alt.confidence === "number" ? alt.confidence : null;
+      const isFinal = Boolean(msg.is_final);
+      const speechFinal = Boolean(msg.speech_final);
+      const evt = { text, confidence, is_final: isFinal, speech_final: speechFinal, ts: Date.now() };
+      if (isFinal) this.emit("final", evt);
+      else this.emit("partial", evt);
+      return;
+    }
+    if (type === "UtteranceEnd") {
+      this.emit("utterance_end", { ts: Date.now() });
+      return;
+    }
+    if (type === "SpeechStarted") {
+      this.emit("speech_started", { ts: Date.now() });
+      return;
+    }
+    if (type === "Metadata") {
+      // Connection-level info, ignored.
+      return;
+    }
+    // Unknown type — log debug, do not throw.
+    this.log.debug({ type }, "deepgram unknown message type");
+  }
+
+  _cancelSilentDegradationWatchdog() {
+    if (this._silentDegradationTimer) {
+      clearTimeout(this._silentDegradationTimer);
+      this._silentDegradationTimer = null;
+    }
   }
 
   _startKeepalive() { /* filled in by Task 4 */ }

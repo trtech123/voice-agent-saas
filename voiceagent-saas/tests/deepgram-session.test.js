@@ -135,3 +135,84 @@ describe("DeepgramSession — connect()", () => {
     expect(lastMockWs.url).toContain("language=en");
   });
 });
+
+describe("DeepgramSession — message dispatch", () => {
+  let s;
+  beforeEach(async () => {
+    lastMockWs = null;
+    s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+  });
+
+  it("emits 'partial' for an interim transcript", () => {
+    const partialSpy = vi.fn();
+    s.on("partial", partialSpy);
+    lastMockWs._msg({
+      type: "Results",
+      is_final: false,
+      speech_final: false,
+      channel: { alternatives: [{ transcript: "שלום", confidence: 0.95 }] },
+    });
+    expect(partialSpy).toHaveBeenCalledTimes(1);
+    const arg = partialSpy.mock.calls[0][0];
+    expect(arg.text).toBe("שלום");
+    expect(arg.confidence).toBe(0.95);
+    expect(arg.is_final).toBe(false);
+    expect(arg.speech_final).toBe(false);
+    expect(typeof arg.ts).toBe("number");
+  });
+
+  it("emits 'final' for is_final=true", () => {
+    const finalSpy = vi.fn();
+    s.on("final", finalSpy);
+    lastMockWs._msg({
+      type: "Results",
+      is_final: true,
+      speech_final: false,
+      channel: { alternatives: [{ transcript: "שלום עולם", confidence: 0.99 }] },
+    });
+    expect(finalSpy).toHaveBeenCalledTimes(1);
+    expect(finalSpy.mock.calls[0][0].text).toBe("שלום עולם");
+    expect(finalSpy.mock.calls[0][0].is_final).toBe(true);
+  });
+
+  it("emits 'utterance_end' on UtteranceEnd message", () => {
+    const ueSpy = vi.fn();
+    s.on("utterance_end", ueSpy);
+    lastMockWs._msg({ type: "UtteranceEnd", channel: [0], last_word_end: 1.234 });
+    expect(ueSpy).toHaveBeenCalledTimes(1);
+    expect(typeof ueSpy.mock.calls[0][0].ts).toBe("number");
+  });
+
+  it("emits 'speech_started' on SpeechStarted message", () => {
+    const ssSpy = vi.fn();
+    s.on("speech_started", ssSpy);
+    lastMockWs._msg({ type: "SpeechStarted", timestamp: 0.5 });
+    expect(ssSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores empty transcripts", () => {
+    const partialSpy = vi.fn();
+    s.on("partial", partialSpy);
+    lastMockWs._msg({
+      type: "Results",
+      is_final: false,
+      channel: { alternatives: [{ transcript: "", confidence: 0.5 }] },
+    });
+    expect(partialSpy).not.toHaveBeenCalled();
+  });
+
+  it("ignores Metadata messages without throwing", () => {
+    expect(() => {
+      lastMockWs._msg({ type: "Metadata", request_id: "abc" });
+    }).not.toThrow();
+  });
+
+  it("ignores malformed JSON without throwing", () => {
+    expect(() => {
+      lastMockWs.emit("message", Buffer.from("not json"));
+    }).not.toThrow();
+  });
+});
