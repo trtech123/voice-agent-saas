@@ -28,6 +28,44 @@ function getAsteriskFrameSizeBytes() {
   return 8000 * ASTERISK_PLAYOUT_FRAME_MS / 1000;
 }
 
+/**
+ * Split a frame-aligned buffer into chunks that each fit under Asterisk's
+ * WebSocket RX payload limit (AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE = 65535).
+ * Each chunk is a multiple of `frameSize` so playout stays frame-aligned.
+ *
+ * Sending a single ws frame > ~65KB triggers "Cannot fit huge websocket
+ * frame" in res_http_websocket.c and closes the channel with code 1009,
+ * which surfaces as ARI ChannelHangupRequest cause 38 "Network out of
+ * order" — observed in production with ~80KB agent_audio bursts.
+ *
+ * @param {Buffer} buffer - the frame-aligned payload to split
+ * @param {number} frameSize - one audio frame in bytes (e.g., 640 for slin16 20ms)
+ * @param {number} maxBytes - max payload per send (default 32768 = 32KB, safe margin)
+ * @returns {Buffer[]}
+ */
+export function chunkForAsteriskWs(buffer, frameSize, maxBytes = 32768) {
+  if (!buffer || buffer.length === 0) return [];
+  if (!Number.isInteger(frameSize) || frameSize <= 0) {
+    throw new Error(`chunkForAsteriskWs: invalid frameSize ${frameSize}`);
+  }
+  // Round maxBytes down to a multiple of frameSize so each slice is aligned.
+  const framesPerChunk = Math.floor(maxBytes / frameSize);
+  if (framesPerChunk < 1) {
+    throw new Error(
+      `chunkForAsteriskWs: frameSize ${frameSize} larger than maxBytes ${maxBytes}`,
+    );
+  }
+  const chunkSize = framesPerChunk * frameSize;
+  if (buffer.length <= chunkSize) {
+    return [buffer];
+  }
+  const out = [];
+  for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+    out.push(buffer.subarray(offset, Math.min(offset + chunkSize, buffer.length)));
+  }
+  return out;
+}
+
 function parseAsteriskControlMessage(message) {
   const text = message.toString();
   try {
@@ -113,9 +151,14 @@ export function registerGatewayMediaSocket(app, gatewayState) {
         return;
       }
 
-      asteriskSocket.send(toSend, { binary: true });
-      mediaState.totalBytesSent += toSend.length;
-      mediaState.totalSendCalls += 1;
+      // Chunk into frame-aligned pieces under Asterisk's WebSocket RX limit
+      // (AST_WEBSOCKET_MAX_RX_PAYLOAD_SIZE = 65535). See chunkForAsteriskWs.
+      const chunks = chunkForAsteriskWs(toSend, frameSize);
+      for (const slice of chunks) {
+        asteriskSocket.send(slice, { binary: true });
+        mediaState.totalBytesSent += slice.length;
+        mediaState.totalSendCalls += 1;
+      }
     }
 
     function flushPendingPartialFrame(reason) {
