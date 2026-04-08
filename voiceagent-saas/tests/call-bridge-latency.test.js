@@ -504,3 +504,98 @@ describe("barge-in handling (interruption event)", () => {
     expect(bridge.latency.turnLatenciesMs.length).toBe(1);
   });
 });
+
+describe("_persistFinalState latency aggregation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+  const audioChunk = () => Buffer.alloc(320);
+
+  // Extract the call_metrics upsert row from the recorded calls.
+  function findCallMetricsUpsert(supabase) {
+    return supabase._upsertCalls.find(
+      (c) => c.row && c.row.call_id && c.row.tenant_id,
+    );
+  }
+
+  it("persists latency fields with turns present", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    for (let i = 0; i < 3; i++) {
+      MockElevenLabsSession.last.emit("user_transcript", {
+        text: `t${i}`,
+        isFinal: true,
+        ts: Date.now(),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    }
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const upsert = findCallMetricsUpsert(supabase);
+    expect(upsert).toBeTruthy();
+    expect(upsert.row.greeting_latency_ms).not.toBe(null);
+    expect(upsert.row.greeting_latency_ms).toBeGreaterThanOrEqual(0);
+    expect(upsert.row.avg_turn_latency_ms).not.toBe(null);
+    expect(upsert.row.p95_turn_latency_ms).not.toBe(null);
+    expect(upsert.row.audio_plumbing_ms).not.toBe(null);
+    expect(upsert.row.turn_latencies_ms).toHaveLength(3);
+  });
+
+  it("persists NULLs when no turns happened", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting only
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const upsert = findCallMetricsUpsert(supabase);
+    expect(upsert.row.greeting_latency_ms).not.toBe(null);
+    expect(upsert.row.avg_turn_latency_ms).toBe(null);
+    expect(upsert.row.p95_turn_latency_ms).toBe(null);
+    expect(upsert.row.turn_latencies_ms).toBe(null);
+  });
+
+  it("bridge upsert uses ignoreDuplicates: false (last-writer-wins)", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const upsert = findCallMetricsUpsert(supabase);
+    expect(upsert.opts).toEqual({
+      onConflict: "call_id",
+      ignoreDuplicates: false,
+    });
+  });
+
+  it("aggregation failure is caught and does not break the upsert", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    // Poison the tracker to force a throw during aggregation.
+    bridge.latency.turnLatenciesMs = {
+      get length() {
+        throw new Error("boom");
+      },
+    };
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    // call_metrics upsert should STILL happen with the non-latency fields.
+    const upsert = findCallMetricsUpsert(supabase);
+    expect(upsert).toBeTruthy();
+    expect(upsert.row.call_id).toBe("cid-1");
+  });
+});

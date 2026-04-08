@@ -722,8 +722,49 @@ export class CallBridge {
       this.log.error({ err }, "calls update on finalize failed");
     }
 
-    // call_metrics: PRIMARY KEY insert, ignore duplicate (StasisEnd may race
-    // with the janitor — both should be safe).
+    // call_metrics: primary-key upsert. Bridge path is last-writer-wins
+    // (ignoreDuplicates: false) so bridge writes always land even when
+    // the janitor raced first with a sparse row. The janitor path at
+    // janitor.js:112 stays ignoreDuplicates: true so it no-ops when a
+    // row already exists — preventing the inverse race. See spec §4.6.
+    let latencyFields = {};
+    try {
+      const turns = this.latency.turnLatenciesMs;
+      const plumbing = this.latency.audioPlumbingSamplesMs;
+      const avgTurn = mean(turns);
+      const avgPlumbing = mean(plumbing);
+      latencyFields = {
+        greeting_latency_ms: this.latency.greetingLatencyMs,
+        avg_turn_latency_ms: avgTurn != null ? Math.round(avgTurn) : null,
+        p95_turn_latency_ms: percentile(turns, 0.95),
+        audio_plumbing_ms: avgPlumbing != null ? Math.round(avgPlumbing) : null,
+        turn_latencies_ms: turns && turns.length ? turns : null,
+      };
+    } catch (err) {
+      this.log.error({ err }, "latency aggregation threw");
+      latencyFields = {};
+    }
+
+    // End-of-call latency summary log (spec §4.3).
+    try {
+      this.log.info(
+        {
+          event: "call_latency_summary",
+          call_id: this.callId,
+          greeting_latency_ms: latencyFields.greeting_latency_ms ?? null,
+          turn_count: Array.isArray(this.latency.turnLatenciesMs)
+            ? this.latency.turnLatenciesMs.length
+            : 0,
+          avg_turn_latency_ms: latencyFields.avg_turn_latency_ms ?? null,
+          p95_turn_latency_ms: latencyFields.p95_turn_latency_ms ?? null,
+          audio_plumbing_ms: latencyFields.audio_plumbing_ms ?? null,
+        },
+        "call latency summary",
+      );
+    } catch (err) {
+      this.log.error({ err }, "call_latency_summary log failed");
+    }
+
     const metricsRow = {
       call_id: this.callId,
       tenant_id: this.tenantId,
@@ -735,11 +776,12 @@ export class CallBridge {
       tool_call_count: this.toolCallCount,
       tts_first_byte_ms: this.ttsFirstByteMs,
       el_ws_open_ms: this.elWsOpenMs,
+      ...latencyFields,
     };
     try {
       await this.supabase
         .from("call_metrics")
-        .upsert(metricsRow, { onConflict: "call_id", ignoreDuplicates: true });
+        .upsert(metricsRow, { onConflict: "call_id", ignoreDuplicates: false });
     } catch (err) {
       this.log.error({ err }, "call_metrics upsert failed");
     }
