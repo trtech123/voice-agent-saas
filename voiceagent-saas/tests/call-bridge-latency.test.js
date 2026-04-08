@@ -599,3 +599,24 @@ describe("_persistFinalState latency aggregation", () => {
     expect(upsert.row.call_id).toBe("cid-1");
   });
 });
+
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+describe("janitor upsert behavior lock (spec §4.6)", () => {
+  it("janitor.js call_metrics upsert uses ignoreDuplicates: true", () => {
+    const janitorPath = resolve(__dirname, "../janitor.js");
+    const src = readFileSync(janitorPath, "utf8");
+    // Find the call_metrics upsert options literal and assert it contains
+    // ignoreDuplicates: true. If someone flips this, the test fails loudly.
+    const metricsUpsertIdx = src.indexOf('from("call_metrics")');
+    expect(metricsUpsertIdx).toBeGreaterThan(-1);
+    // Look at the ~500 chars following the from() call.
+    const slice = src.slice(metricsUpsertIdx, metricsUpsertIdx + 500);
+    expect(slice).toContain("ignoreDuplicates: true");
+    expect(slice).not.toContain("ignoreDuplicates: false");
+  });
+});
