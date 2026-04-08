@@ -65,3 +65,73 @@ describe("DeepgramSession — constructor", () => {
     expect(s).toBeTruthy();
   });
 });
+
+describe("DeepgramSession — connect()", () => {
+  beforeEach(() => { lastMockWs = null; });
+
+  it("opens WS with the correct base URL", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.url).toMatch(/^wss:\/\/api\.deepgram\.com\/v1\/listen\?/);
+  });
+
+  it("includes model=nova-2, language=he, encoding=linear16 in query string", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.url).toContain("model=nova-2");
+    expect(lastMockWs.url).toContain("language=he");
+    expect(lastMockWs.url).toContain("encoding=linear16");
+    expect(lastMockWs.url).toContain("sample_rate=16000");
+    expect(lastMockWs.url).toContain("channels=1");
+    expect(lastMockWs.url).toContain("interim_results=true");
+    expect(lastMockWs.url).toContain("utterance_end_ms=700");
+    expect(lastMockWs.url).toContain("smart_format=true");
+    expect(lastMockWs.url).toContain("vad_events=true");
+  });
+
+  it("does NOT include endpointing param (turn commit is owned by our VAD)", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.url).not.toContain("endpointing=");
+  });
+
+  it("sends Authorization: Token <key> header", async () => {
+    const s = new DeepgramSession({ apiKey: "my-key", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.opts.headers.Authorization).toBe("Token my-key");
+  });
+
+  it("emits ws_open event when WS opens", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const wsOpenSpy = vi.fn();
+    s.on("ws_open", wsOpenSpy);
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(wsOpenSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects with dg_connect_failed if WS errors before open", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs.emit("error", new Error("ECONNREFUSED"));
+    await expect(p).rejects.toMatchObject({ code: "dg_connect_failed" });
+  });
+
+  it("model and language can be overridden via constructor", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger(), model: "nova-3", language: "en" });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.url).toContain("model=nova-3");
+    expect(lastMockWs.url).toContain("language=en");
+  });
+});
