@@ -12,101 +12,197 @@
  * request_callback, mark_opt_out, end_call.
  */
 
+// ─── Tool Catalog ───────────────────────────────────────────────────
+
+/**
+ * Single source of truth for SaaS voice-agent tool schemas.
+ *
+ * Each entry carries the canonical name + description plus two parameter
+ * shapes:
+ *   - `legacy`  : Gemini-style (OBJECT/STRING/NUMBER casing) consumed by
+ *                 `buildToolDefinitions()` and the EL convai adapter.
+ *   - `openai`  : OpenAI function-calling style (lowercase JSON-schema
+ *                 types) consumed by `buildOpenAIToolSchema()` for the new
+ *                 unbundled LLM session.
+ *
+ * NOTE: `score_lead` intentionally diverges between the two shapes.
+ * Production convai flow requires {score, status, answers}; the new
+ * unbundled pipeline (per spec §3.3) expects a simpler {score, reason}
+ * surface and post-processes status/answers from the transcript.
+ */
+export const TOOL_CATALOG = [
+  {
+    name: "score_lead",
+    description:
+      "Score the lead based on qualification answers. Call this before ending the call.",
+    legacy: {
+      properties: {
+        score: {
+          type: "NUMBER",
+          description: "Lead score from 1 (cold) to 5 (very hot)",
+        },
+        status: {
+          type: "STRING",
+          description: "Lead status: hot, warm, cold, not_interested, or callback",
+          enum: ["hot", "warm", "cold", "not_interested", "callback"],
+        },
+        answers: {
+          type: "OBJECT",
+          description:
+            "Key-value pairs of qualification question answers. Keys match the question keys from the campaign config.",
+          properties: {},
+        },
+      },
+      required: ["score", "status", "answers"],
+    },
+    openai: {
+      properties: {
+        score: {
+          type: "integer",
+          description: "Lead score from 1 (cold) to 5 (very hot)",
+        },
+        reason: {
+          type: "string",
+          description: "Short justification for the assigned score",
+        },
+      },
+      required: ["score", "reason"],
+    },
+  },
+  {
+    name: "send_whatsapp",
+    description:
+      "Send a WhatsApp follow-up message to the lead with details or a booking link.",
+    legacy: {
+      properties: {
+        message: {
+          type: "STRING",
+          description:
+            "Optional custom message. If omitted, the campaign's default WhatsApp template is used.",
+        },
+      },
+      required: [],
+    },
+    openai: {
+      properties: {
+        message: {
+          type: "string",
+          description:
+            "Custom WhatsApp follow-up message body to send to the lead.",
+        },
+      },
+      required: ["message"],
+    },
+  },
+  {
+    name: "request_callback",
+    description:
+      "The lead wants to be called back at a different time. Record their preference.",
+    legacy: {
+      properties: {
+        preferred_time: {
+          type: "STRING",
+          description:
+            "When the lead wants to be called back (free text, e.g. '\u05DE\u05D7\u05E8 \u05D1\u05D1\u05D5\u05E7\u05E8')",
+        },
+      },
+      required: ["preferred_time"],
+    },
+    openai: {
+      properties: {
+        preferred_time: {
+          type: "string",
+          description:
+            "When the lead wants to be called back (free text, e.g. '\u05DE\u05D7\u05E8 \u05D1\u05D1\u05D5\u05E7\u05E8')",
+        },
+      },
+      required: ["preferred_time"],
+    },
+  },
+  {
+    name: "mark_opt_out",
+    description:
+      "The lead explicitly asked not to be contacted again. Permanently removes them from all campaigns for this business.",
+    legacy: {
+      properties: {},
+      required: [],
+    },
+    openai: {
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "end_call",
+    description: "End the current call. Must call score_lead before this.",
+    legacy: {
+      properties: {
+        disposition: {
+          type: "STRING",
+          description:
+            "Call disposition: completed_qualified, not_interested, callback_scheduled, opt_out, or error",
+        },
+      },
+      required: ["disposition"],
+    },
+    openai: {
+      properties: {
+        disposition: {
+          type: "string",
+          description:
+            "Call disposition: completed_qualified, not_interested, callback_scheduled, opt_out, or error",
+        },
+      },
+      required: [],
+    },
+  },
+];
+
 // ─── Tool Definitions ───────────────────────────────────────────────
 
 /**
- * Build the canonical tool declarations for the SaaS voice agent.
- * Vendor adapters (elevenlabs-tools-adapter.js) translate these into
+ * Build the canonical (Gemini-style) tool declarations for the SaaS voice
+ * agent. Vendor adapters (elevenlabs-tools-adapter.js) translate these into
  * provider-specific shapes.
+ *
+ * Returns an array of function declarations. For backwards compatibility
+ * with callers that read `.functionDeclarations` (EL adapter), the array
+ * also carries a `functionDeclarations` property pointing to itself.
  */
 export function buildToolDefinitions() {
-  return {
-    functionDeclarations: [
-      {
-        name: "score_lead",
-        description:
-          "Score the lead based on qualification answers. Call this before ending the call.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            score: {
-              type: "NUMBER",
-              description: "Lead score from 1 (cold) to 5 (very hot)",
-            },
-            status: {
-              type: "STRING",
-              description: "Lead status: hot, warm, cold, not_interested, or callback",
-              enum: ["hot", "warm", "cold", "not_interested", "callback"],
-            },
-            answers: {
-              type: "OBJECT",
-              description:
-                "Key-value pairs of qualification question answers. Keys match the question keys from the campaign config.",
-              properties: {},
-            },
-          },
-          required: ["score", "status", "answers"],
-        },
+  const decls = TOOL_CATALOG.map((entry) => ({
+    name: entry.name,
+    description: entry.description,
+    parameters: {
+      type: "OBJECT",
+      properties: entry.legacy.properties,
+      required: entry.legacy.required,
+    },
+  }));
+  Object.defineProperty(decls, "functionDeclarations", {
+    value: decls,
+    enumerable: false,
+  });
+  return decls;
+}
+
+/**
+ * Build the OpenAI function-calling tool schema for the SaaS voice agent,
+ * suitable for passing directly to chat.completions `tools` parameter.
+ */
+export function buildOpenAIToolSchema() {
+  return TOOL_CATALOG.map((entry) => ({
+    type: "function",
+    function: {
+      name: entry.name,
+      description: entry.description,
+      parameters: {
+        type: "object",
+        properties: entry.openai.properties,
+        required: entry.openai.required,
       },
-      {
-        name: "send_whatsapp",
-        description:
-          "Send a WhatsApp follow-up message to the lead with details or a booking link.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            message: {
-              type: "STRING",
-              description:
-                "Optional custom message. If omitted, the campaign's default WhatsApp template is used.",
-            },
-          },
-          required: [],
-        },
-      },
-      {
-        name: "request_callback",
-        description:
-          "The lead wants to be called back at a different time. Record their preference.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            preferred_time: {
-              type: "STRING",
-              description: "When the lead wants to be called back (free text, e.g. '\u05DE\u05D7\u05E8 \u05D1\u05D1\u05D5\u05E7\u05E8')",
-            },
-          },
-          required: ["preferred_time"],
-        },
-      },
-      {
-        name: "mark_opt_out",
-        description:
-          "The lead explicitly asked not to be contacted again. Permanently removes them from all campaigns for this business.",
-        parameters: {
-          type: "OBJECT",
-          properties: {},
-          required: [],
-        },
-      },
-      {
-        name: "end_call",
-        description:
-          "End the current call. Must call score_lead before this.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            disposition: {
-              type: "STRING",
-              description:
-                "Call disposition: completed_qualified, not_interested, callback_scheduled, opt_out, or error",
-            },
-          },
-          required: ["disposition"],
-        },
-      },
-    ],
-  };
+    },
+  }));
 }
 
 // ─── Tool Execution ─────────────────────────────────────────────────
