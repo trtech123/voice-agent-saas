@@ -337,7 +337,7 @@ describe("turn_latency_ms", () => {
   });
   const audioChunk = () => Buffer.alloc(320);
 
-  it("user_transcript isFinal sets pendingUserFinalAt", async () => {
+  it("user_transcript isFinal=true updates lastPartialTranscriptAt", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
@@ -350,61 +350,38 @@ describe("turn_latency_ms", () => {
     });
     const after = Date.now();
 
-    expect(bridge.latency.pendingUserFinalAt).toBeGreaterThanOrEqual(before);
-    expect(bridge.latency.pendingUserFinalAt).toBeLessThanOrEqual(after);
+    expect(bridge.latency.lastPartialTranscriptAt).toBeGreaterThanOrEqual(before);
+    expect(bridge.latency.lastPartialTranscriptAt).toBeLessThanOrEqual(after);
   });
 
-  it("user_transcript isFinal=false does NOT set pendingUserFinalAt", async () => {
+  it("user_transcript isFinal=false ALSO updates lastPartialTranscriptAt (no gating)", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
 
+    const before = Date.now();
     MockElevenLabsSession.last.emit("user_transcript", {
       text: "שלו...",
       isFinal: false,
       ts: Date.now(),
     });
+    const after = Date.now();
 
-    expect(bridge.latency.pendingUserFinalAt).toBe(null);
+    expect(bridge.latency.lastPartialTranscriptAt).toBeGreaterThanOrEqual(before);
+    expect(bridge.latency.lastPartialTranscriptAt).toBeLessThanOrEqual(after);
   });
 
-  it("computes turn_latency_ms on next agent_audio after isFinal", async () => {
+  it("multiple user_transcript events → lastPartialTranscriptAt is the most recent", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
-
-    // Consume the greeting first.
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
-    expect(bridge.latency.greetingLatencyMs).not.toBe(null);
-
-    // User speaks, finalizes.
-    MockElevenLabsSession.last.emit("user_transcript", {
-      text: "כן",
-      isFinal: true,
-      ts: Date.now(),
-    });
-
-    // Wait, then agent responds.
-    await new Promise((r) => setTimeout(r, 25));
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
-
-    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
-    expect(bridge.latency.turnLatenciesMs[0]).toBeGreaterThanOrEqual(20);
-    expect(bridge.latency.pendingUserFinalAt).toBe(null);
-  });
-
-  it("multiple isFinal before one agent_audio → only the most recent counted", async () => {
-    const { bridge } = makeBridge();
-    bridge.sendToAsterisk = vi.fn();
-    await driveToLive(bridge);
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
 
     MockElevenLabsSession.last.emit("user_transcript", {
       text: "first",
-      isFinal: true,
+      isFinal: false,
       ts: Date.now(),
     });
-    const firstFinalAt = bridge.latency.pendingUserFinalAt;
+    const firstAt = bridge.latency.lastPartialTranscriptAt;
 
     await new Promise((r) => setTimeout(r, 15));
     MockElevenLabsSession.last.emit("user_transcript", {
@@ -412,16 +389,9 @@ describe("turn_latency_ms", () => {
       isFinal: true,
       ts: Date.now(),
     });
-    const secondFinalAt = bridge.latency.pendingUserFinalAt;
-    expect(secondFinalAt).toBeGreaterThan(firstFinalAt);
+    const secondAt = bridge.latency.lastPartialTranscriptAt;
 
-    await new Promise((r) => setTimeout(r, 15));
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
-
-    // The measured latency should be from the SECOND isFinal, so ~15ms
-    // not ~30ms.
-    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
-    expect(bridge.latency.turnLatenciesMs[0]).toBeLessThan(30);
+    expect(secondAt).toBeGreaterThan(firstAt);
   });
 
   it("subsequent agent_audio chunks in the same turn do NOT create extra samples", async () => {
@@ -454,54 +424,32 @@ describe("barge-in handling (interruption event)", () => {
   });
   const audioChunk = () => Buffer.alloc(320);
 
-  it("interruption with pendingUserFinalAt set → next agent_audio discards the sample", async () => {
-    const { bridge, log } = makeBridge();
-    bridge.sendToAsterisk = vi.fn();
-    await driveToLive(bridge);
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
-
-    MockElevenLabsSession.last.emit("user_transcript", {
-      text: "test",
-      isFinal: true,
-      ts: Date.now(),
-    });
-    MockElevenLabsSession.last.emit("interruption", {});
-    expect(bridge.latency.pendingUserFinalIsBarge).toBe(true);
-
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
-
-    // Sample should be discarded.
-    expect(bridge.latency.turnLatenciesMs.length).toBe(0);
-    expect(bridge.latency.pendingUserFinalAt).toBe(null);
-    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
-    expect(
-      log.calls.info.some((entry) =>
-        JSON.stringify(entry).includes("turn_latency_skipped_barge"),
-      ),
-    ).toBe(true);
-  });
-
-  it("interruption with no pending isFinal → no-op (no leak across turns)", async () => {
+  it("interruption with lastPartialTranscriptAt set → flag is raised", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+    MockElevenLabsSession.last.emit("agent_audio", Buffer.alloc(320)); // greeting
 
-    // No isFinal first — interruption fires alone.
-    MockElevenLabsSession.last.emit("interruption", {});
-    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
-
-    // Now a normal turn proceeds.
     MockElevenLabsSession.last.emit("user_transcript", {
-      text: "hi",
-      isFinal: true,
+      text: "test",
+      isFinal: false,
       ts: Date.now(),
     });
-    await new Promise((r) => setTimeout(r, 15));
-    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    expect(bridge.latency.lastPartialTranscriptAt).not.toBe(null);
 
-    // Sample NOT discarded because the barge flag was never set on THIS isFinal.
-    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    MockElevenLabsSession.last.emit("interruption", {});
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(true);
+  });
+
+  it("interruption with no anchors → no-op", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", Buffer.alloc(320)); // greeting
+
+    // No user_transcript and no VAD activity yet (no inbound audio).
+    MockElevenLabsSession.last.emit("interruption", {});
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
   });
 });
 

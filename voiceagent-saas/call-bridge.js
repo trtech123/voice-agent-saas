@@ -24,6 +24,14 @@
 import { ElevenLabsSession } from "./elevenlabs-session.js";
 import { enqueueTurn, flushAndClose } from "./live-turn-writer.js";
 import { executeToolCall } from "./tools.js";
+import { createSilenceDetector } from "./vad.js";
+import {
+  VAD_RMS_THRESHOLD,
+  VAD_SILENCE_DEBOUNCE_MS,
+  VAD_SANITY_GAP_MS,
+  VAD_CONSECUTIVE_SILENT_FRAMES,
+  VAD_AGENT_AUDIO_TAIL_MS,
+} from "./vad-config.js";
 
 // ─── Active Bridge Tracking ─────────────────────────────────────────
 
@@ -154,15 +162,24 @@ export class CallBridge {
     this.inboundAudioChunks = 0;
     this.outboundAudioChunks = 0;
 
-    // Latency tracker (spec §4.1)
+    // Latency tracker (spec §4.1 + VAD spec §4.5)
     this.latency = {
       customerAnsweredAt: null,
       greetingLatencyMs: null,
-      pendingUserFinalAt: null,
+      lastPartialTranscriptAt: null,
       pendingUserFinalIsBarge: false,
       turnLatenciesMs: [],
       audioPlumbingSamplesMs: [],
+      vadFallbackCount: 0,
     };
+
+    // VAD detector (one per call). Echo-gated via setMuted during agent playback.
+    this.vad = createSilenceDetector({
+      threshold: VAD_RMS_THRESHOLD,
+      debounceMs: VAD_SILENCE_DEBOUNCE_MS,
+      consecutiveSilentFrames: VAD_CONSECUTIVE_SILENT_FRAMES,
+    });
+    this._vadUnmuteTimer = null;
   }
 
   /**
@@ -391,15 +408,31 @@ export class CallBridge {
       } catch (err) {
         this.log.error({ err }, "latency recording threw");
       }
+
+      // Echo gating (VAD spec §4.5): mute VAD while agent is speaking and
+      // for VAD_AGENT_AUDIO_TAIL_MS after. Renewed on every outbound chunk.
+      // Must run AFTER _recordAgentAudioLatency so the first chunk's turn
+      // latency uses the pre-mute VAD state from the user's last turn.
+      try {
+        this.vad.setMuted(true);
+        if (this._vadUnmuteTimer) clearTimeout(this._vadUnmuteTimer);
+        this._vadUnmuteTimer = setTimeout(() => {
+          this._vadUnmuteTimer = null;
+          try {
+            this.vad.setMuted(false);
+          } catch (err) {
+            this.log.error({ err }, "vad.setMuted(false) threw");
+          }
+        }, VAD_AGENT_AUDIO_TAIL_MS);
+      } catch (err) {
+        this.log.error({ err }, "echo gating threw");
+      }
     });
 
     session.on("user_transcript", ({ text, isFinal, ts }) => {
-      // Latency tracking (spec §3.2, §4.2): only the most recent isFinal
-      // counts — overwriting is intentional.
-      if (isFinal === true) {
-        this.latency.pendingUserFinalAt = Date.now();
-        this.latency.pendingUserFinalIsBarge = false;
-      }
+      // VAD spec §4.5: every partial updates the fallback anchor.
+      // No gating on isFinal — the current agent config never sets it.
+      this.latency.lastPartialTranscriptAt = Date.now();
 
       this.turnCount += 1;
       enqueueTurn({
@@ -438,12 +471,14 @@ export class CallBridge {
     });
 
     session.on("interruption", () => {
-      // Spec §6: if a user isFinal is pending, flag it as a barge so the
-      // next agent_audio (which is the continuation of the interrupted
-      // agent speech, not a fresh response) is discarded as a sample.
-      // If nothing is pending, this is a pure agent-turn barge and is a
-      // no-op — the flag only matters relative to a live pending isFinal.
-      if (this.latency.pendingUserFinalAt != null) {
+      // VAD spec §4.5: set barge flag only if at least one anchor
+      // is available (RMS VAD finalized a stop, OR EL sent a partial).
+      // Otherwise this is a pure agent-turn barge with nothing to
+      // poison, so we no-op to prevent cross-turn flag leaks.
+      if (
+        this.vad.getUserStoppedAt() != null ||
+        this.latency.lastPartialTranscriptAt != null
+      ) {
         this.latency.pendingUserFinalIsBarge = true;
       }
     });
@@ -494,16 +529,21 @@ export class CallBridge {
    * from inside the agent_audio handler. Best-effort — caller wraps in
    * try/catch so throws cannot impact audio dispatch.
    *
-   * Handles three sample paths:
+   * Handles two sample paths:
    *   1. Greeting first chunk: computes greeting_latency_ms (once per call).
-   *   2. Turn first chunk: computes turn_latency_ms from pendingUserFinalAt.
+   *   2. Turn first chunk: computes turn_latency_ms via VAD + EL-partial
+   *      hybrid anchor selection (VAD spec §4.2, §4.5). The sanity-gap
+   *      rule rejects RMS VAD output that is far later than EL's last
+   *      partial (indicating noise held RMS above threshold after the
+   *      user actually stopped).
    *   3. Barge-in case: discards the turn sample if pendingUserFinalIsBarge.
    *
    * audio_plumbing_ms samples (sentAt - receivedAt) are pushed on the
-   * greeting first chunk AND on non-barge turn first chunks. No sample
-   * on subsequent chunks in the same turn (pendingUserFinalAt is cleared).
+   * greeting first chunk AND on non-barge turn first chunks. The VAD
+   * reset at the end of the turn path ensures subsequent chunks within
+   * the same agent response do not double-count.
    *
-   * Spec §3.1, §3.2, §3.3, §4.2, §6.
+   * Spec §3.1, §3.3, §4.2; VAD spec §4.5, §4.2.
    */
   _recordAgentAudioLatency(receivedAt, sentAt) {
     // Greeting path
@@ -538,42 +578,85 @@ export class CallBridge {
       return;
     }
 
-    // Turn path
-    if (this.latency.pendingUserFinalAt != null) {
-      if (this.latency.pendingUserFinalIsBarge) {
-        this.log.info(
-          {
-            event: "turn_latency_skipped_barge",
-            call_id: this.callId,
-          },
-          "turn latency sample discarded due to interruption",
-        );
-        this.latency.pendingUserFinalAt = null;
-        this.latency.pendingUserFinalIsBarge = false;
-        return;
+    // Turn path — VAD spec §4.5
+    this.vad.resolvePending(receivedAt);
+    const userStoppedAtRms = this.vad.getUserStoppedAt();
+    const lastPartial = this.latency.lastPartialTranscriptAt;
+
+    let userStoppedAt = null;
+    let source = null;
+    if (userStoppedAtRms != null && lastPartial != null) {
+      if (userStoppedAtRms - lastPartial > VAD_SANITY_GAP_MS) {
+        // RMS said the user stopped much later than EL's last partial —
+        // noise held the RMS above threshold after real speech ended.
+        // Trust EL's partial.
+        userStoppedAt = lastPartial;
+        source = "el_partial_fallback";
+        this.latency.vadFallbackCount += 1;
+      } else {
+        userStoppedAt = userStoppedAtRms;
+        source = "rms_vad";
       }
-      const userFinalAt = this.latency.pendingUserFinalAt;
-      const tl = clampNonNegative(receivedAt - userFinalAt);
-      this.latency.turnLatenciesMs.push(tl);
-      if (sentAt != null) {
-        this.latency.audioPlumbingSamplesMs.push(
-          clampNonNegative(sentAt - receivedAt),
-        );
-      }
+    } else if (userStoppedAtRms != null) {
+      userStoppedAt = userStoppedAtRms;
+      source = "rms_vad";
+    } else if (lastPartial != null) {
+      userStoppedAt = lastPartial;
+      source = "el_partial_fallback";
+      this.latency.vadFallbackCount += 1;
+    }
+
+    if (userStoppedAt == null) {
+      // No anchor — skip the sample entirely.
+      this.log.debug(
+        {
+          event: "turn_latency_skipped_no_anchor",
+          call_id: this.callId,
+        },
+        "turn latency skipped (no anchor available)",
+      );
+      this.vad.reset();
+      this.latency.lastPartialTranscriptAt = null;
+      this.latency.pendingUserFinalIsBarge = false;
+      return;
+    }
+
+    if (this.latency.pendingUserFinalIsBarge) {
       this.log.info(
         {
-          event: "turn_latency",
+          event: "turn_latency_skipped_barge",
           call_id: this.callId,
-          turn_index: this.latency.turnLatenciesMs.length,
-          user_final_at: userFinalAt,
-          agent_audio_at: receivedAt,
-          turn_latency_ms: tl,
         },
-        "turn latency measured",
+        "turn latency discarded (barge)",
       );
-      this.latency.pendingUserFinalAt = null;
+      this.vad.reset();
+      this.latency.lastPartialTranscriptAt = null;
       this.latency.pendingUserFinalIsBarge = false;
+      return;
     }
+
+    const tl = clampNonNegative(receivedAt - userStoppedAt);
+    this.latency.turnLatenciesMs.push(tl);
+    if (sentAt != null) {
+      this.latency.audioPlumbingSamplesMs.push(
+        clampNonNegative(sentAt - receivedAt),
+      );
+    }
+    this.log.info(
+      {
+        event: "turn_latency",
+        call_id: this.callId,
+        turn_index: this.latency.turnLatenciesMs.length,
+        user_stopped_at: userStoppedAt,
+        agent_audio_at: receivedAt,
+        turn_latency_ms: tl,
+        source,
+      },
+      "turn latency measured",
+    );
+    this.vad.reset();
+    this.latency.lastPartialTranscriptAt = null;
+    this.latency.pendingUserFinalIsBarge = false;
   }
 
   // ─── Asterisk -> Bridge ────────────────────────────────────────
@@ -653,6 +736,13 @@ export class CallBridge {
     } catch (err) {
       this.log.error({ err }, "session.sendAudio threw");
     }
+
+    // VAD fed AFTER sendAudio so a VAD throw cannot delay forwarding.
+    try {
+      this.vad.pushChunk(audioBuffer, Date.now());
+    } catch (err) {
+      this.log.error({ err }, "vad.pushChunk threw");
+    }
   }
 
   // ─── Bridge Lifecycle ───────────────────────────────────────────
@@ -678,6 +768,13 @@ export class CallBridge {
       } catch (err) {
         this.log.error({ err }, "session.close threw during finalize");
       }
+    }
+
+    // Clear the VAD unmute timer so a stale timer cannot fire after
+    // the bridge ends (VAD spec §5).
+    if (this._vadUnmuteTimer) {
+      clearTimeout(this._vadUnmuteTimer);
+      this._vadUnmuteTimer = null;
     }
 
     activeBridges.delete(this.callId);
@@ -739,6 +836,7 @@ export class CallBridge {
         p95_turn_latency_ms: percentile(turns, 0.95),
         audio_plumbing_ms: avgPlumbing != null ? Math.round(avgPlumbing) : null,
         turn_latencies_ms: turns && turns.length ? turns : null,
+        vad_fallback_count: this.latency.vadFallbackCount || 0,
       };
     } catch (err) {
       this.log.error({ err }, "latency aggregation threw");
@@ -758,6 +856,7 @@ export class CallBridge {
           avg_turn_latency_ms: latencyFields.avg_turn_latency_ms ?? null,
           p95_turn_latency_ms: latencyFields.p95_turn_latency_ms ?? null,
           audio_plumbing_ms: latencyFields.audio_plumbing_ms ?? null,
+          vad_fallback_count: latencyFields.vad_fallback_count ?? null,
         },
         "call latency summary",
       );
