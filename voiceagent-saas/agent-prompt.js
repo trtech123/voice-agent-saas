@@ -128,3 +128,32 @@ export function buildIdleNudgeInstruction() {
 export function buildHallucinationCorrectionInstruction() {
   return "עצור/י. הזכרת מידע מסוים בלי שקראת לכלי. המידע שנתת עלול להיות שגוי. אם הלקוח שאל משהו שדורש בדיקה, אמור/י לו שאת/ה בודק/ת ופנה/י לכלי המתאים. אם אין כלי רלוונטי, אמור/י שתבדוק/י ותחזור/י אליו.";
 }
+
+/**
+ * Build a system prompt and first message from a campaign row, interpolating
+ * dynamic variables like {{contact_name}}, {{business_name}}, etc. Used by
+ * the unbundled voice pipeline (plan 5) which sources prompts from
+ * campaigns.system_prompt and campaigns.first_message instead of fetching
+ * from the EL agent config.
+ *
+ * Spec: docs/superpowers/specs/2026-04-08-unbundled-voice-pipeline-design.md §4.4, §5.4
+ *
+ * @param {object} args
+ * @param {string|null} args.systemPrompt - raw system prompt from campaigns.system_prompt
+ * @param {string|null} args.firstMessage - raw first message from campaigns.first_message
+ * @param {Record<string,string>} args.dynamicVariables - {{var}} substitutions
+ * @returns {{ systemPrompt: string, firstMessage: string }}
+ */
+export function buildFromCampaign({ systemPrompt, firstMessage, dynamicVariables }) {
+  const vars = dynamicVariables || {};
+  const interpolate = (s) => {
+    if (s == null) return "";
+    return String(s).replace(/\{\{(\w+)\}\}/g, (_, key) =>
+      Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : `{{${key}}}`,
+    );
+  };
+  return {
+    systemPrompt: interpolate(systemPrompt),
+    firstMessage: interpolate(firstMessage),
+  };
+}
