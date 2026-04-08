@@ -437,6 +437,17 @@ export class CallBridge {
       });
     });
 
+    session.on("interruption", () => {
+      // Spec §6: if a user isFinal is pending, flag it as a barge so the
+      // next agent_audio (which is the continuation of the interrupted
+      // agent speech, not a fresh response) is discarded as a sample.
+      // If nothing is pending, this is a pure agent-turn barge and is a
+      // no-op — the flag only matters relative to a live pending isFinal.
+      if (this.latency.pendingUserFinalAt != null) {
+        this.latency.pendingUserFinalIsBarge = true;
+      }
+    });
+
     session.on("tool_call", async ({ name, args, callId: toolCallId, reply }) => {
       this.toolCallCount += 1;
       this.log.info({ tool: name, toolCallId }, "EL tool_call received");

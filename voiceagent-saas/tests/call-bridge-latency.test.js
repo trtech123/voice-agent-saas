@@ -446,3 +446,61 @@ describe("turn_latency_ms", () => {
     expect(bridge.latency.audioPlumbingSamplesMs.length).toBe(2);
   });
 });
+
+describe("barge-in handling (interruption event)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+  const audioChunk = () => Buffer.alloc(320);
+
+  it("interruption with pendingUserFinalAt set → next agent_audio discards the sample", async () => {
+    const { bridge, log } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "test",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    MockElevenLabsSession.last.emit("interruption", {});
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(true);
+
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    // Sample should be discarded.
+    expect(bridge.latency.turnLatenciesMs.length).toBe(0);
+    expect(bridge.latency.pendingUserFinalAt).toBe(null);
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
+    expect(
+      log.calls.info.some((entry) =>
+        JSON.stringify(entry).includes("turn_latency_skipped_barge"),
+      ),
+    ).toBe(true);
+  });
+
+  it("interruption with no pending isFinal → no-op (no leak across turns)", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    // No isFinal first — interruption fires alone.
+    MockElevenLabsSession.last.emit("interruption", {});
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
+
+    // Now a normal turn proceeds.
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "hi",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    // Sample NOT discarded because the barge flag was never set on THIS isFinal.
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+  });
+});
