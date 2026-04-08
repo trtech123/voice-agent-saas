@@ -262,3 +262,81 @@ describe("DeepgramSession — KeepAlive", () => {
     expect(kas).toHaveLength(0);
   });
 });
+
+describe("DeepgramSession — reconnect", () => {
+  beforeEach(() => { lastMockWs = null; vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("attempts one reconnect on unexpected close", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+
+    // Capture the second WS construction.
+    const firstWs = lastMockWs;
+    firstWs.emit("close", 1006, Buffer.from("abnormal"));
+
+    // _attemptReconnect should construct a new WS after a 100ms backoff.
+    await vi.advanceTimersByTimeAsync(150);
+    expect(lastMockWs).not.toBe(firstWs);
+    expect(lastMockWs.url).toContain("model=nova-2");
+  });
+
+  it("emits dg_dropped error if reconnect WS itself errors", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+
+    const errSpy = vi.fn();
+    s.on("error", errSpy);
+
+    const firstWs = lastMockWs;
+    firstWs.emit("close", 1006, Buffer.from("abnormal"));
+    await vi.advanceTimersByTimeAsync(150);
+
+    // The new WS errors before opening
+    lastMockWs.emit("error", new Error("ECONNREFUSED"));
+
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0].code).toBe("dg_dropped");
+  });
+
+  it("does NOT reconnect after explicit close()", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+
+    const firstWs = lastMockWs;
+    s.close();
+    expect(firstWs.readyState).toBe(3); // CLOSED
+    await vi.advanceTimersByTimeAsync(500);
+    expect(lastMockWs).toBe(firstWs); // no new WS
+  });
+
+  it("does NOT attempt a second reconnect after the first reconnect closes", async () => {
+    const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+
+    const wsA = lastMockWs;
+    wsA.emit("close", 1006, Buffer.from(""));
+    await vi.advanceTimersByTimeAsync(150);
+
+    const wsB = lastMockWs;
+    expect(wsB).not.toBe(wsA);
+    wsB._open(); // first reconnect succeeds
+    wsB.emit("close", 1006, Buffer.from("")); // and immediately drops again
+
+    const errSpy = vi.fn();
+    s.on("error", errSpy);
+    await vi.advanceTimersByTimeAsync(500);
+    // Should NOT have constructed a third WS
+    expect(lastMockWs).toBe(wsB);
+    // Should have emitted dg_dropped
+    expect(errSpy).toHaveBeenCalledTimes(1);
+  });
+});

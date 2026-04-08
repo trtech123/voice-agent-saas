@@ -187,7 +187,61 @@ export class DeepgramSession extends EventEmitter {
       }
     }, KEEPALIVE_INTERVAL_MS);
   }
-  _attemptReconnect() { /* filled in by Task 5 */ }
+  _attemptReconnect() {
+    if (this._closed) return;
+    if (this._reconnectAttempted) {
+      // Second drop = give up.
+      this.log.error("Deepgram WS dropped after reconnect — failing call");
+      setTimeout(() => {
+        if (this._closed) return;
+        this.emit("error", new DeepgramSessionError("WS dropped after reconnect", "dg_dropped"));
+      }, 0);
+      return;
+    }
+    this._reconnectAttempted = true;
+    this.log.warn({ backoffMs: RECONNECT_INITIAL_BACKOFF_MS }, "Deepgram WS reconnecting");
+
+    setTimeout(() => {
+      if (this._closed) return;
+      // Build a new WS with the same params. Re-running connect() is the
+      // simplest way to share the URL/header logic.
+      const params = new URLSearchParams({
+        model: this.model,
+        language: this.language,
+        encoding: "linear16",
+        sample_rate: "16000",
+        channels: "1",
+        multichannel: "false",
+        interim_results: "true",
+        utterance_end_ms: "700",
+        smart_format: "true",
+        vad_events: "true",
+      });
+      const url = `${DG_BASE}?${params.toString()}`;
+      let ws;
+      try {
+        ws = new WebSocket(url, { headers: { Authorization: `Token ${this.apiKey}` } });
+      } catch (err) {
+        this.emit("error", new DeepgramSessionError(`reconnect construct failed: ${err.message}`, "dg_dropped"));
+        return;
+      }
+      this.ws = ws;
+
+      const onErr = (err) => {
+        if (this._closed) return;
+        ws.removeListener("open", onOpen);
+        this.emit("error", new DeepgramSessionError(`reconnect failed: ${err.message}`, "dg_dropped"));
+      };
+      const onOpen = () => {
+        ws.removeListener("error", onErr);
+        this.log.info("Deepgram WS reconnected");
+        this._wireRunningHandlers(ws);
+        this.emit("ws_reopen");
+      };
+      ws.once("open", onOpen);
+      ws.once("error", onErr);
+    }, RECONNECT_INITIAL_BACKOFF_MS);
+  }
 
   /**
    * Send a 20ms slin16 frame (640 bytes) as a binary WS message.
