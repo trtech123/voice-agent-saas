@@ -367,19 +367,29 @@ export class CallBridge {
     });
 
     session.on("agent_audio", (buffer) => {
+      const receivedAt = Date.now();
       this.outboundAudioChunks += 1;
       if (!this.firstAudioReceivedAt) {
-        this.firstAudioReceivedAt = Date.now();
-        this.ttsFirstByteMs = this.firstAudioReceivedAt - this.elWsOpenedAt;
+        this.firstAudioReceivedAt = receivedAt;
+        this.ttsFirstByteMs = receivedAt - this.elWsOpenedAt;
       }
-      // EL audio is already PCM16 LE @ 16 kHz (assertion enforced inside the
-      // session). slin16 expects exactly the same — no resampling.
+
+      // Hot path: dispatch audio FIRST. Instrumentation MUST NOT delay this.
+      let sentAt = null;
       if (this.sendToAsterisk) {
         try {
           this.sendToAsterisk(buffer.toString("base64"));
+          sentAt = Date.now();
         } catch (err) {
           this.log.error({ err }, "sendToAsterisk threw");
         }
+      }
+
+      // Observability (best-effort, wrapped so a throw cannot impact audio).
+      try {
+        this._recordAgentAudioLatency(receivedAt, sentAt);
+      } catch (err) {
+        this.log.error({ err }, "latency recording threw");
       }
     });
 
@@ -459,6 +469,93 @@ export class CallBridge {
       // double-finalize here. The cleanup() / endBridge() path is the
       // single source of truth for the calls row write.
     });
+  }
+
+  /**
+   * Record latency for one agent_audio chunk. Called AFTER sendToAsterisk
+   * from inside the agent_audio handler. Best-effort — caller wraps in
+   * try/catch so throws cannot impact audio dispatch.
+   *
+   * Handles three sample paths:
+   *   1. Greeting first chunk: computes greeting_latency_ms (once per call).
+   *   2. Turn first chunk: computes turn_latency_ms from pendingUserFinalAt.
+   *   3. Barge-in case: discards the turn sample if pendingUserFinalIsBarge.
+   *
+   * audio_plumbing_ms samples (sentAt - receivedAt) are pushed on the
+   * greeting first chunk AND on non-barge turn first chunks. No sample
+   * on subsequent chunks in the same turn (pendingUserFinalAt is cleared).
+   *
+   * Spec §3.1, §3.2, §3.3, §4.2, §6.
+   */
+  _recordAgentAudioLatency(receivedAt, sentAt) {
+    // Greeting path
+    if (this.latency.greetingLatencyMs == null) {
+      if (this.latency.customerAnsweredAt != null) {
+        const gl = clampNonNegative(receivedAt - this.latency.customerAnsweredAt);
+        this.latency.greetingLatencyMs = gl;
+        if (sentAt != null) {
+          this.latency.audioPlumbingSamplesMs.push(
+            clampNonNegative(sentAt - receivedAt),
+          );
+        }
+        this.log.info(
+          {
+            event: "greeting_latency",
+            call_id: this.callId,
+            greeting_latency_ms: gl,
+          },
+          "greeting latency measured",
+        );
+        return;
+      }
+      // Defensive: agent_audio arrived but we never got customer_answered.
+      // Only warn if state is live (to skip expected early-media / ringback
+      // frames during pre_warmed). Should not happen post-lifecycle-fix.
+      if (this._state === "live") {
+        this.log.warn(
+          { event: "greeting_latency_skipped_no_answer", call_id: this.callId },
+          "agent_audio before customer_answered — greeting_latency not computed",
+        );
+      }
+      return;
+    }
+
+    // Turn path
+    if (this.latency.pendingUserFinalAt != null) {
+      if (this.latency.pendingUserFinalIsBarge) {
+        this.log.info(
+          {
+            event: "turn_latency_skipped_barge",
+            call_id: this.callId,
+          },
+          "turn latency sample discarded due to interruption",
+        );
+        this.latency.pendingUserFinalAt = null;
+        this.latency.pendingUserFinalIsBarge = false;
+        return;
+      }
+      const userFinalAt = this.latency.pendingUserFinalAt;
+      const tl = clampNonNegative(receivedAt - userFinalAt);
+      this.latency.turnLatenciesMs.push(tl);
+      if (sentAt != null) {
+        this.latency.audioPlumbingSamplesMs.push(
+          clampNonNegative(sentAt - receivedAt),
+        );
+      }
+      this.log.info(
+        {
+          event: "turn_latency",
+          call_id: this.callId,
+          turn_index: this.latency.turnLatenciesMs.length,
+          user_final_at: userFinalAt,
+          agent_audio_at: receivedAt,
+          turn_latency_ms: tl,
+        },
+        "turn latency measured",
+      );
+      this.latency.pendingUserFinalAt = null;
+      this.latency.pendingUserFinalIsBarge = false;
+    }
   }
 
   // ─── Asterisk -> Bridge ────────────────────────────────────────

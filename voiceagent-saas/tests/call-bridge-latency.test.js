@@ -250,3 +250,82 @@ describe("customerAnsweredAt stamping", () => {
     expect(bridge.latency.customerAnsweredAt).toBe(first);
   });
 });
+
+describe("greeting_latency_ms", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+
+  // Helper: a tiny PCM16 buffer. Content doesn't matter for these tests.
+  const audioChunk = () => Buffer.alloc(320);
+
+  it("computes greeting_latency_ms on first agent_audio after customer_answered", async () => {
+    const { bridge } = makeBridge();
+    // Install a fake sendToAsterisk so the hot path runs without throwing.
+    bridge.sendToAsterisk = vi.fn();
+
+    await driveToLive(bridge);
+    // Wait ~20ms, then emit the first agent_audio.
+    await new Promise((r) => setTimeout(r, 20));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.greetingLatencyMs).not.toBe(null);
+    expect(bridge.latency.greetingLatencyMs).toBeGreaterThanOrEqual(15);
+    expect(bridge.latency.greetingLatencyMs).toBeLessThan(500);
+  });
+
+  it("only computes greeting_latency_ms once (second chunk is a no-op for greeting)", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    await new Promise((r) => setTimeout(r, 10));
+
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    const first = bridge.latency.greetingLatencyMs;
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.greetingLatencyMs).toBe(first);
+  });
+
+  it("greeting_latency_ms stays null if customer never answered", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    bridge.start();
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("ws_open");
+    // Never call handleCustomerAnswered.
+    // Simulate a rogue agent_audio arriving anyway (defensive path).
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.greetingLatencyMs).toBe(null);
+  });
+
+  it("sendToAsterisk is called BEFORE greeting latency is computed (hot path first)", async () => {
+    const { bridge } = makeBridge();
+    const order = [];
+    bridge.sendToAsterisk = vi.fn(() => order.push("send"));
+    // Monkey-patch _recordAgentAudioLatency after construction to observe ordering.
+    const origRecord = bridge._recordAgentAudioLatency.bind(bridge);
+    bridge._recordAgentAudioLatency = (receivedAt, sentAt) => {
+      order.push("record");
+      return origRecord(receivedAt, sentAt);
+    };
+
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(order).toEqual(["send", "record"]);
+  });
+
+  it("audio_plumbing sample is recorded for the greeting first chunk", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.audioPlumbingSamplesMs.length).toBe(1);
+    expect(bridge.latency.audioPlumbingSamplesMs[0]).toBeGreaterThanOrEqual(0);
+  });
+});
