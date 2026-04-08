@@ -85,6 +85,10 @@ export function createSilenceDetector({
     muted = Boolean(value);
   }
 
+  function getMuted() {
+    return muted;
+  }
+
   function resolvePending(/* now */) {
     if (userStoppedAt == null && silenceStartAt != null) {
       userStoppedAt = silenceStartAt;
@@ -103,5 +107,5 @@ export function createSilenceDetector({
     // muted deliberately NOT reset — CallBridge owns that.
   }
 
-  return { pushChunk, setMuted, resolvePending, getUserStoppedAt, reset };
+  return { pushChunk, setMuted, getMuted, resolvePending, getUserStoppedAt, reset };
 }

@@ -430,9 +430,17 @@ export class CallBridge {
     });
 
     session.on("user_transcript", ({ text, isFinal, ts }) => {
-      // VAD spec §4.5: every partial updates the fallback anchor.
-      // No gating on isFinal — the current agent config never sets it.
-      this.latency.lastPartialTranscriptAt = Date.now();
+      // VAD spec §4.5: partials update the EL fallback anchor, BUT only
+      // when VAD is listening. If VAD is muted (agent is playing or in
+      // the echo-tail window), any incoming "partial" is a framing
+      // artifact from Gemini — not real user speech — and must not
+      // poison the turn-latency anchor. Without this gate, every agent
+      // response produces a phantom el_partial_fallback sample ~200ms
+      // after the real turn sample (confirmed on call 06d36398 —
+      // 7 phantoms in 15 samples; vad_fallback_count=7 matched exactly).
+      if (!this.vad.getMuted()) {
+        this.latency.lastPartialTranscriptAt = Date.now();
+      }
 
       this.turnCount += 1;
       enqueueTurn({

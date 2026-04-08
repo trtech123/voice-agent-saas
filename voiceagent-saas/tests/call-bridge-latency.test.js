@@ -354,7 +354,7 @@ describe("turn_latency_ms", () => {
     expect(bridge.latency.lastPartialTranscriptAt).toBeLessThanOrEqual(after);
   });
 
-  it("user_transcript isFinal=false ALSO updates lastPartialTranscriptAt (no gating)", async () => {
+  it("user_transcript isFinal=false updates lastPartialTranscriptAt when VAD is unmuted (no isFinal gating)", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
@@ -399,6 +399,9 @@ describe("turn_latency_ms", () => {
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
     MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+    // Wait for echo-gate to release (VAD_AGENT_AUDIO_TAIL_MS=200ms) so
+    // the user_transcript below is not dropped as a phantom partial.
+    await new Promise((r) => setTimeout(r, 250));
 
     MockElevenLabsSession.last.emit("user_transcript", {
       text: "test",
@@ -429,6 +432,8 @@ describe("barge-in handling (interruption event)", () => {
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
     MockElevenLabsSession.last.emit("agent_audio", Buffer.alloc(320)); // greeting
+    // Wait for echo-gate release so the partial below isn't dropped.
+    await new Promise((r) => setTimeout(r, 250));
 
     MockElevenLabsSession.last.emit("user_transcript", {
       text: "test",
@@ -474,6 +479,9 @@ describe("_persistFinalState latency aggregation", () => {
     MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
 
     for (let i = 0; i < 3; i++) {
+      // Wait for echo-gate release from the previous agent chunk so the
+      // partial isn't dropped as a phantom (VAD_AGENT_AUDIO_TAIL_MS=200ms).
+      await new Promise((r) => setTimeout(r, 250));
       MockElevenLabsSession.last.emit("user_transcript", {
         text: `t${i}`,
         isFinal: true,
@@ -628,6 +636,8 @@ describe("VAD + hybrid turn latency", () => {
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
     MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+    // Wait for echo-gate release so subsequent user events aren't dropped.
+    await new Promise((r) => setTimeout(r, 250));
 
     // User audio is continuously loud — VAD never detects silence.
     for (let i = 0; i < 5; i++) {
@@ -666,6 +676,8 @@ describe("VAD + hybrid turn latency", () => {
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
     MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+    // Wait for echo-gate release so subsequent user events aren't dropped.
+    await new Promise((r) => setTimeout(r, 250));
 
     // Force one fallback turn.
     for (let i = 0; i < 5; i++) bridge.handleCallerAudio(audioChunk());
@@ -727,11 +739,45 @@ describe("VAD + hybrid turn latency", () => {
     expect(bridge._vadUnmuteTimer).toBe(null);
   });
 
+  it("user_transcript arriving while VAD is muted does NOT update the anchor (phantom-partial guard)", async () => {
+    // Reproduces production bug observed on call 06d36398: Gemini emits a
+    // spurious user_transcript partial at the moment each agent response
+    // starts. Because echo gating mutes the VAD during agent playback, any
+    // partial arriving while muted is a framing artifact, not real user
+    // speech, and must not poison lastPartialTranscriptAt. Without this
+    // guard, the next agent_audio chunk in the same response produces a
+    // phantom el_partial_fallback sample with a tiny (~200ms) delta.
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+
+    // Greeting chunk — mutes the VAD (echo gate engaged).
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    expect(bridge.vad.getMuted()).toBe(true);
+
+    // Phantom partial arrives while VAD is muted. Must be IGNORED.
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "",
+      isFinal: false,
+      ts: Date.now(),
+    });
+    expect(bridge.latency.lastPartialTranscriptAt).toBe(null);
+
+    // Second agent_audio chunk of the same response — there is no real
+    // anchor, so NO turn sample should be recorded.
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.turnLatenciesMs.length).toBe(0);
+    expect(bridge.latency.vadFallbackCount).toBe(0);
+  });
+
   it("barge flag is cleared on success path (not just skip paths)", async () => {
     const { bridge } = makeBridge();
     bridge.sendToAsterisk = vi.fn();
     await driveToLive(bridge);
     MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+    // Wait for echo-gate release so the partial below isn't dropped.
+    await new Promise((r) => setTimeout(r, 250));
 
     // Simulate a user turn that produces a partial anchor, then a successful
     // non-barge turn measurement.
