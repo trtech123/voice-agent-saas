@@ -119,6 +119,19 @@ REDIS_URL=redis://default:<pass>@junction.proxy.rlwy.net:47885
 USE_VERTEX_AI=false  # Set to true when gemini-3.1 is available on Vertex AI EU
 ```
 
+#### Unbundled voice pipeline env vars (plan 1, 2026-04-08):
+```
+DEEPGRAM_API_KEY=<from deepgram.com console>
+OPENAI_API_KEY=<from platform.openai.com>
+
+# Behavior tunables (defaults match spec, safe to leave as-is)
+DEEPGRAM_BARGE_GATE_MS=150          # min ms after last TTS chunk before a Deepgram partial counts as barge
+LLM_MAX_ROUNDS_PER_CALL=50          # cap on total LLM rounds across a whole call
+LLM_HISTORY_WINDOW_TURNS=20         # sliding history window size
+BARGE_LOOP_THRESHOLD=5              # barge count that triggers loop detection
+BARGE_LOOP_WINDOW_MS=30000          # window for the threshold above
+```
+
 ### Voicenter SIP
 - Extension: F53WYCSk
 - Server: 185.138.169.235 (sip09.voicenter.co resolved to IP)
@@ -127,6 +140,26 @@ USE_VERTEX_AI=false  # Set to true when gemini-3.1 is available on Vertex AI EU
 
 ### Phone number format
 Israeli numbers are converted from international (972...) to local (0...) format before dialing via Voicenter.
+
+## Voice pipeline feature flag (plan 1, 2026-04-08)
+
+Each campaign can independently use one of two voice pipelines:
+
+- **`convai`** (default) — the existing ElevenLabs Convai bundled stack. Single WebSocket, EL handles STT + turn detection + LLM + TTS.
+- **`unbundled`** — Deepgram STT + OpenAI gpt-4o-mini LLM + ElevenLabs `eleven_turbo_v2_5` TTS, with our own VAD driving turn commits. Built across plans 2-5 of `2026-04-08-unbundled-pipeline-*.md`.
+
+Resolution at dequeue: `campaign.voice_pipeline ?? tenant.default_voice_pipeline ?? 'convai'`. Snapshotted into the call's in-memory cfg so mid-queue flag flips do not affect in-flight calls. Per-campaign rollback is a single SQL update — instant, no code deploy.
+
+To migrate a campaign to unbundled:
+```bash
+node voiceagent-saas/scripts/migrate-campaign-to-unbundled.js <campaign_id>          # dry run
+node voiceagent-saas/scripts/migrate-campaign-to-unbundled.js <campaign_id> --apply  # commit
+```
+
+To roll back:
+```sql
+UPDATE campaigns SET voice_pipeline = 'convai' WHERE id = '<campaign_id>';
+```
 
 ## Testing a call
 
