@@ -169,7 +169,24 @@ export class DeepgramSession extends EventEmitter {
     }
   }
 
-  _startKeepalive() { /* filled in by Task 4 */ }
+  _startKeepalive() {
+    if (this._keepaliveTimer) return;
+    this._keepaliveTimer = setInterval(() => {
+      if (this._closed) return;
+      const sinceLastAudio = Date.now() - this._lastAudioSentAt;
+      // Skip if audio was sent within the quiet threshold (the audio
+      // itself keeps the connection alive on Deepgram's side).
+      if (this._lastAudioSentAt > 0 && sinceLastAudio < KEEPALIVE_QUIET_THRESHOLD_MS) {
+        return;
+      }
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      try {
+        this.ws.send(JSON.stringify({ type: "KeepAlive" }));
+      } catch (err) {
+        this.log.warn({ err: err.message }, "deepgram KeepAlive send threw");
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+  }
   _attemptReconnect() { /* filled in by Task 5 */ }
 
   /**

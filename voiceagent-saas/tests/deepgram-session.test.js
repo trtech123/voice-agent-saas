@@ -216,3 +216,49 @@ describe("DeepgramSession — message dispatch", () => {
     }).not.toThrow();
   });
 });
+
+describe("DeepgramSession — KeepAlive", () => {
+  let s;
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    lastMockWs = null;
+    s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+  });
+  afterEach(() => {
+    s.close();
+    vi.useRealTimers();
+  });
+
+  it("sends KeepAlive after 5s of no audio activity", () => {
+    expect(lastMockWs.sent.length).toBe(0);
+    vi.advanceTimersByTime(5100);
+    const ka = lastMockWs.sent.find((m) => typeof m === "string" && m.includes("KeepAlive"));
+    expect(ka).toBeTruthy();
+    expect(JSON.parse(ka)).toEqual({ type: "KeepAlive" });
+  });
+
+  it("does NOT send KeepAlive if audio was sent within the quiet threshold", () => {
+    s.sendAudio(Buffer.alloc(640));
+    vi.advanceTimersByTime(4000); // less than 4500ms quiet threshold
+    const ka = lastMockWs.sent.find((m) => typeof m === "string" && m.includes("KeepAlive"));
+    expect(ka).toBeUndefined();
+  });
+
+  it("sends KeepAlive again 5s later", () => {
+    vi.advanceTimersByTime(5100);
+    vi.advanceTimersByTime(5100);
+    const kas = lastMockWs.sent.filter((m) => typeof m === "string" && m.includes("KeepAlive"));
+    expect(kas.length).toBe(2);
+  });
+
+  it("stops sending KeepAlive after close()", () => {
+    s.close();
+    lastMockWs.sent.length = 0;
+    vi.advanceTimersByTime(20000);
+    const kas = lastMockWs.sent.filter((m) => typeof m === "string" && m.includes("KeepAlive"));
+    expect(kas).toHaveLength(0);
+  });
+});
