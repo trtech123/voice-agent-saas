@@ -568,3 +568,183 @@ describe("janitor upsert behavior lock (spec §4.6)", () => {
     expect(slice).not.toContain("ignoreDuplicates: false");
   });
 });
+
+describe("VAD + hybrid turn latency", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+
+  // Build a slin16 PCM16 LE 20ms frame (320 samples = 640 bytes) at the
+  // given amplitude.
+  const audioChunk = (value = 5000) => {
+    const buf = Buffer.alloc(640);
+    for (let i = 0; i < 320; i++) buf.writeInt16LE(value, i * 2);
+    return buf;
+  };
+  const silentChunk = () => Buffer.alloc(640); // all zeros
+
+  it("uses rms_vad source when VAD resolves normally", async () => {
+    const { bridge, log } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    // Greeting first so subsequent agent_audio takes the turn path.
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    // Wait for the echo-gate unmute timer (VAD_AGENT_AUDIO_TAIL_MS=200ms) to fire
+    // before feeding caller audio, so the VAD is not muted.
+    await new Promise((r) => setTimeout(r, 250));
+
+    // Simulate: user speaks → stops (3 silent + debounce) → EL responds.
+    bridge.handleCallerAudio(audioChunk());       // speech
+    await new Promise((r) => setTimeout(r, 5));
+    bridge.handleCallerAudio(silentChunk());      // quiet 1
+    bridge.handleCallerAudio(silentChunk());      // quiet 2
+    bridge.handleCallerAudio(silentChunk());      // quiet 3 → silenceStartAt set
+    // Wait so resolvePending triggers via agent_audio.
+    await new Promise((r) => setTimeout(r, 20));
+    // Partial transcript also fires (EL saw speech).
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "כן",
+      isFinal: false,
+      ts: Date.now(),
+    });
+
+    // Now EL responds — this drives resolvePending via agent_audio handler.
+    await new Promise((r) => setTimeout(r, 20));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    // A sample was recorded with source rms_vad (not fallback).
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    expect(bridge.latency.vadFallbackCount).toBe(0);
+    const logEntry = log.calls.info.find((e) =>
+      JSON.stringify(e).includes('"event":"turn_latency"'),
+    );
+    expect(logEntry).toBeTruthy();
+    expect(JSON.stringify(logEntry)).toContain('"source":"rms_vad"');
+  });
+
+  it("falls back to el_partial when VAD has no anchor (continuous speech)", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    // User audio is continuously loud — VAD never detects silence.
+    for (let i = 0; i < 5; i++) {
+      bridge.handleCallerAudio(audioChunk());
+    }
+    // But EL sent a partial transcript.
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "hi",
+      isFinal: false,
+      ts: Date.now(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // EL responds.
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    expect(bridge.latency.vadFallbackCount).toBe(1);
+  });
+
+  it("skips the sample entirely when both anchors are null", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    // No inbound audio, no partials — then another agent_audio arrives.
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.turnLatenciesMs.length).toBe(0);
+    expect(bridge.latency.vadFallbackCount).toBe(0);
+  });
+
+  it("vad_fallback_count persisted to call_metrics at finalize", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    // Force one fallback turn.
+    for (let i = 0; i < 5; i++) bridge.handleCallerAudio(audioChunk());
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "test",
+      isFinal: false,
+      ts: Date.now(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const upsert = supabase._upsertCalls.find(
+      (c) => c.row && c.row.call_id === "cid-1",
+    );
+    expect(upsert).toBeTruthy();
+    expect(upsert.row.vad_fallback_count).toBe(1);
+  });
+
+  it("vad_fallback_count is 0 when no turns happened", async () => {
+    const { bridge, supabase } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting only
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 20));
+
+    const upsert = supabase._upsertCalls.find(
+      (c) => c.row && c.row.call_id === "cid-1",
+    );
+    expect(upsert.row.vad_fallback_count).toBe(0);
+  });
+
+  it("echo gating: agent_audio mutes the VAD", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+
+    // Spy on setMuted.
+    const setMutedSpy = vi.spyOn(bridge.vad, "setMuted");
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(setMutedSpy).toHaveBeenCalledWith(true);
+    expect(bridge._vadUnmuteTimer).not.toBe(null);
+  });
+
+  it("echo gating: timer is cleared on _finalizeAndResolve", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    expect(bridge._vadUnmuteTimer).not.toBe(null);
+
+    bridge.endBridge("test_done");
+    await new Promise((r) => setTimeout(r, 5));
+    expect(bridge._vadUnmuteTimer).toBe(null);
+  });
+
+  it("barge flag is cleared on success path (not just skip paths)", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    // Simulate a user turn that produces a partial anchor, then a successful
+    // non-barge turn measurement.
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "yes",
+      isFinal: false,
+      ts: Date.now(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    // Barge flag should be false after a normal success.
+    expect(bridge.latency.pendingUserFinalIsBarge).toBe(false);
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+  });
+});
