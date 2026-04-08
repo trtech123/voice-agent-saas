@@ -77,18 +77,19 @@ describe("DeepgramSession — connect()", () => {
     expect(lastMockWs.url).toMatch(/^wss:\/\/api\.deepgram\.com\/v1\/listen\?/);
   });
 
-  it("includes model=nova-2, language=he, encoding=linear16 in query string", async () => {
+  it("includes model=nova-3, language=he, encoding=linear16 in query string", async () => {
     const s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
     const p = s.connect();
     lastMockWs._open();
     await p;
-    expect(lastMockWs.url).toContain("model=nova-2");
+    expect(lastMockWs.url).toContain("model=nova-3");
     expect(lastMockWs.url).toContain("language=he");
     expect(lastMockWs.url).toContain("encoding=linear16");
     expect(lastMockWs.url).toContain("sample_rate=16000");
     expect(lastMockWs.url).toContain("channels=1");
     expect(lastMockWs.url).toContain("interim_results=true");
-    expect(lastMockWs.url).toContain("utterance_end_ms=700");
+    // utterance_end_ms intentionally omitted — see deepgram-session.js comment.
+    expect(lastMockWs.url).not.toContain("utterance_end_ms");
     expect(lastMockWs.url).toContain("smart_format=true");
     expect(lastMockWs.url).toContain("vad_events=true");
   });
@@ -178,12 +179,40 @@ describe("DeepgramSession — message dispatch", () => {
     expect(finalSpy.mock.calls[0][0].is_final).toBe(true);
   });
 
-  it("emits 'utterance_end' on UtteranceEnd message", () => {
+  it("emits 'utterance_end' on UtteranceEnd message (defensive — Deepgram does not send these on Nova-3)", () => {
     const ueSpy = vi.fn();
     s.on("utterance_end", ueSpy);
     lastMockWs._msg({ type: "UtteranceEnd", channel: [0], last_word_end: 1.234 });
     expect(ueSpy).toHaveBeenCalledTimes(1);
     expect(typeof ueSpy.mock.calls[0][0].ts).toBe("number");
+  });
+
+  it("synthesizes 'utterance_end' from Results.speech_final=true", () => {
+    const ueSpy = vi.fn();
+    const finalSpy = vi.fn();
+    s.on("utterance_end", ueSpy);
+    s.on("final", finalSpy);
+    lastMockWs._msg({
+      type: "Results",
+      is_final: true,
+      speech_final: true,
+      channel: { alternatives: [{ transcript: "סיימתי", confidence: 0.97 }] },
+    });
+    expect(finalSpy).toHaveBeenCalledTimes(1);
+    expect(ueSpy).toHaveBeenCalledTimes(1);
+    expect(typeof ueSpy.mock.calls[0][0].ts).toBe("number");
+  });
+
+  it("does NOT synthesize 'utterance_end' when speech_final=false", () => {
+    const ueSpy = vi.fn();
+    s.on("utterance_end", ueSpy);
+    lastMockWs._msg({
+      type: "Results",
+      is_final: true,
+      speech_final: false,
+      channel: { alternatives: [{ transcript: "ביניים", confidence: 0.9 }] },
+    });
+    expect(ueSpy).not.toHaveBeenCalled();
   });
 
   it("emits 'speech_started' on SpeechStarted message", () => {
@@ -280,7 +309,7 @@ describe("DeepgramSession — reconnect", () => {
     // _attemptReconnect should construct a new WS after a 100ms backoff.
     await vi.advanceTimersByTimeAsync(150);
     expect(lastMockWs).not.toBe(firstWs);
-    expect(lastMockWs.url).toContain("model=nova-2");
+    expect(lastMockWs.url).toContain("model=nova-3");
   });
 
   it("emits dg_dropped error if reconnect WS itself errors", async () => {

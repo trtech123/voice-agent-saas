@@ -35,7 +35,7 @@ export class DeepgramSession extends EventEmitter {
    * @param {object} opts
    * @param {string} opts.apiKey - Deepgram API key
    * @param {object} opts.logger - pino-compatible
-   * @param {string} [opts.model="nova-2"] - falls back to nova-2 if not specified
+   * @param {string} [opts.model="nova-3"] - Deepgram dropped Hebrew from nova-2; nova-3 general is the only Hebrew tier as of 2026-04
    * @param {string} [opts.language="he"]
    */
   constructor({ apiKey, logger, model, language } = {}) {
@@ -44,11 +44,12 @@ export class DeepgramSession extends EventEmitter {
     if (!logger) throw new Error("DeepgramSession: logger required");
     this.apiKey = apiKey;
     this.log = logger;
-    this.model = model || "nova-2";
+    this.model = model || "nova-3";
     this.language = language || "he";
 
     this.ws = null;
     this._closed = false;
+    this._finishing = false;
     this._lastAudioSentAt = 0;
     this._lastInboundAt = 0;
     this._keepaliveTimer = null;
@@ -68,7 +69,10 @@ export class DeepgramSession extends EventEmitter {
       channels: "1",
       multichannel: "false",
       interim_results: "true",
-      utterance_end_ms: "700",
+      // utterance_end_ms is not supported on Nova-3 WS for any language as of
+      // 2026-04-09 (live probe verified — request returns HTTP 400). We
+      // synthesize the `utterance_end` event from Results.speech_final=true
+      // instead, which Deepgram emits when its internal endpointer fires.
       smart_format: "true",
       vad_events: "true",
     });
@@ -117,6 +121,10 @@ export class DeepgramSession extends EventEmitter {
     ws.on("close", (code, reasonBuf) => {
       if (this._closed) return;
       const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString() : String(reasonBuf || "");
+      if (this._finishing) {
+        this.log.info({ code, reason }, "Deepgram WS closed after finish() — not reconnecting");
+        return;
+      }
       this.log.warn({ code, reason }, "Deepgram WS closed unexpectedly, attempting reconnect");
       this._attemptReconnect();
     });
@@ -144,9 +152,13 @@ export class DeepgramSession extends EventEmitter {
       const evt = { text, confidence, is_final: isFinal, speech_final: speechFinal, ts: Date.now() };
       if (isFinal) this.emit("final", evt);
       else this.emit("partial", evt);
+      // Synthesize utterance_end from speech_final since Deepgram Nova-3 WS
+      // does not accept utterance_end_ms — see comment in connect().
+      if (speechFinal) this.emit("utterance_end", { ts: Date.now() });
       return;
     }
     if (type === "UtteranceEnd") {
+      // Defensive: still honor if Deepgram ever starts sending it.
       this.emit("utterance_end", { ts: Date.now() });
       return;
     }
@@ -213,7 +225,7 @@ export class DeepgramSession extends EventEmitter {
         channels: "1",
         multichannel: "false",
         interim_results: "true",
-        utterance_end_ms: "700",
+        // utterance_end_ms intentionally omitted — see comment in connect()
         smart_format: "true",
         vad_events: "true",
       });
@@ -261,6 +273,9 @@ export class DeepgramSession extends EventEmitter {
    */
   finish() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // Mark finishing so the WS close that follows the server's CloseStream
+    // ack does not trigger an unwanted reconnect.
+    this._finishing = true;
     try {
       this.ws.send(JSON.stringify({ type: "CloseStream" }));
     } catch (err) {
