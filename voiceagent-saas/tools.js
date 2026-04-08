@@ -25,10 +25,24 @@
  *                 types) consumed by `buildOpenAIToolSchema()` for the new
  *                 unbundled LLM session.
  *
- * NOTE: `score_lead` intentionally diverges between the two shapes.
- * Production convai flow requires {score, status, answers}; the new
- * unbundled pipeline (per spec §3.3) expects a simpler {score, reason}
- * surface and post-processes status/answers from the transcript.
+ * NOTE: Three tools intentionally diverge between the two shapes —
+ * each divergence reflects a real runtime contract difference, not drift:
+ *
+ *   - `score_lead`: production convai requires {score, status, answers}.
+ *     The unbundled pipeline LLM session will use a thin
+ *     mapOpenAIToolArgs() shim (Plan 3) to translate {score, reason} →
+ *     {score, status, answers} before calling handleScoreLead().
+ *
+ *   - `send_whatsapp.message`: optional in convai (server-side template
+ *     fallback) but required in OpenAI shape because the unbundled
+ *     pipeline does not yet wire the template fallback.
+ *
+ *   - `end_call.disposition`: required in convai but optional in OpenAI
+ *     shape because handleEndCall() defaults to "completed" when missing,
+ *     and a more flexible LLM-side schema reduces tool-call friction.
+ *
+ * Tool names and descriptions stay in single-source — drift on those is
+ * impossible because both formatters consume the one TOOL_CATALOG below.
  */
 export const TOOL_CATALOG = [
   {
