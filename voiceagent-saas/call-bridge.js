@@ -75,6 +75,26 @@ function mapErrorCodeToFailureReason(code) {
   }
 }
 
+// ─── Latency Helpers (spec §4.4) ────────────────────────────────────
+
+export function clampNonNegative(n) {
+  return typeof n === "number" && n >= 0 ? n : 0;
+}
+
+export function mean(arr) {
+  if (!arr || arr.length === 0) return null;
+  let s = 0;
+  for (const v of arr) s += v;
+  return s / arr.length;
+}
+
+export function percentile(arr, p) {
+  if (!arr || arr.length === 0) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
+  return sorted[idx];
+}
+
 // ─── Call Bridge Class ──────────────────────────────────────────────
 
 export class CallBridge {
@@ -133,6 +153,16 @@ export class CallBridge {
     this.toolCallCount = 0;
     this.inboundAudioChunks = 0;
     this.outboundAudioChunks = 0;
+
+    // Latency tracker (spec §4.1)
+    this.latency = {
+      customerAnsweredAt: null,
+      greetingLatencyMs: null,
+      pendingUserFinalAt: null,
+      pendingUserFinalIsBarge: false,
+      turnLatenciesMs: [],
+      audioPlumbingSamplesMs: [],
+    };
   }
 
   /**

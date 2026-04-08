@@ -134,3 +134,65 @@ describe("CallBridge latency — harness sanity", () => {
     expect(MockElevenLabsSession.last.startConversationCalls).toBe(1);
   });
 });
+
+// Re-import helpers. We expose them on the module for testability.
+const callBridgeModule = await import("../call-bridge.js");
+const { clampNonNegative, mean, percentile } = callBridgeModule;
+
+describe("latency helpers", () => {
+  describe("clampNonNegative", () => {
+    it("returns the number when positive", () => {
+      expect(clampNonNegative(42)).toBe(42);
+    });
+    it("returns the number when zero", () => {
+      expect(clampNonNegative(0)).toBe(0);
+    });
+    it("returns 0 when negative (clock went backward)", () => {
+      expect(clampNonNegative(-5)).toBe(0);
+    });
+    it("returns 0 for non-numbers", () => {
+      expect(clampNonNegative(null)).toBe(0);
+      expect(clampNonNegative(undefined)).toBe(0);
+      expect(clampNonNegative("5")).toBe(0);
+    });
+  });
+
+  describe("mean", () => {
+    it("returns null on empty", () => {
+      expect(mean([])).toBe(null);
+    });
+    it("returns null on null/undefined", () => {
+      expect(mean(null)).toBe(null);
+      expect(mean(undefined)).toBe(null);
+    });
+    it("returns the single value on n=1", () => {
+      expect(mean([7])).toBe(7);
+    });
+    it("computes arithmetic mean", () => {
+      expect(mean([1, 2, 3, 4, 5])).toBe(3);
+    });
+  });
+
+  describe("percentile", () => {
+    it("returns null on empty", () => {
+      expect(percentile([], 0.95)).toBe(null);
+    });
+    it("returns the single value on n=1", () => {
+      expect(percentile([100], 0.95)).toBe(100);
+    });
+    it("degenerates to max at small n (n=2, p=0.95) — locked behavior", () => {
+      // floor(0.95 * 2) = 1 → sorted[1] = max. Do NOT "fix" this.
+      expect(percentile([10, 20], 0.95)).toBe(20);
+    });
+    it("n=5: floor(4.75)=4 → max", () => {
+      expect(percentile([1, 2, 3, 4, 5], 0.95)).toBe(5);
+    });
+    it("n=20: floor(19)=19 → max", () => {
+      const arr = Array.from({ length: 20 }, (_, i) => i + 1);
+      expect(percentile(arr, 0.95)).toBe(20);
+    });
+    it("is order-independent (sorts internally)", () => {
+      expect(percentile([5, 1, 4, 2, 3], 0.95)).toBe(5);
+    });
+  });
+});
