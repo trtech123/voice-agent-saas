@@ -340,3 +340,48 @@ describe("DeepgramSession — reconnect", () => {
     expect(errSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("DeepgramSession — sendAudio / finish / close", () => {
+  let s;
+  beforeEach(async () => {
+    lastMockWs = null;
+    s = new DeepgramSession({ apiKey: "k", logger: makeLogger() });
+    const p = s.connect();
+    lastMockWs._open();
+    await p;
+  });
+
+  it("sendAudio forwards binary buffer to WS", () => {
+    const buf = Buffer.alloc(640, 7);
+    s.sendAudio(buf);
+    expect(lastMockWs.sent).toContain(buf);
+  });
+
+  it("sendAudio is a no-op when WS is not OPEN", () => {
+    lastMockWs.readyState = 0;
+    expect(() => s.sendAudio(Buffer.alloc(640))).not.toThrow();
+  });
+
+  it("finish sends a CloseStream JSON frame", () => {
+    s.finish();
+    const cs = lastMockWs.sent.find((m) => typeof m === "string" && m.includes("CloseStream"));
+    expect(cs).toBeTruthy();
+    expect(JSON.parse(cs)).toEqual({ type: "CloseStream" });
+  });
+
+  it("close emits closed event with the reason", () => {
+    const closedSpy = vi.fn();
+    s.on("closed", closedSpy);
+    s.close("test_reason");
+    expect(closedSpy).toHaveBeenCalledTimes(1);
+    expect(closedSpy.mock.calls[0][0]).toEqual({ reason: "test_reason" });
+  });
+
+  it("close is idempotent", () => {
+    const closedSpy = vi.fn();
+    s.on("closed", closedSpy);
+    s.close();
+    s.close();
+    expect(closedSpy).toHaveBeenCalledTimes(1);
+  });
+});
