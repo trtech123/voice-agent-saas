@@ -177,6 +177,7 @@ function clampNonNegative(n) {
 }
 
 function mean(arr) {
+  if (!arr || arr.length === 0) return null;
   let s = 0;
   for (const v of arr) s += v;
   return s / arr.length;
@@ -217,39 +218,45 @@ alter table public.call_metrics
   add column if not exists audio_plumbing_ms  int,
   add column if not exists turn_latencies_ms  int[];
 
+-- Non-negative guards. Plain inline CHECK — all existing rows have NULL in
+-- the new columns so validation is instant; no need for the `not valid` +
+-- validate dance.
 alter table public.call_metrics
   add constraint call_metrics_greeting_latency_nonneg
-    check (greeting_latency_ms is null or greeting_latency_ms >= 0) not valid;
-alter table public.call_metrics validate constraint call_metrics_greeting_latency_nonneg;
-
+    check (greeting_latency_ms is null or greeting_latency_ms >= 0);
 alter table public.call_metrics
   add constraint call_metrics_avg_turn_latency_nonneg
-    check (avg_turn_latency_ms is null or avg_turn_latency_ms >= 0) not valid;
-alter table public.call_metrics validate constraint call_metrics_avg_turn_latency_nonneg;
-
+    check (avg_turn_latency_ms is null or avg_turn_latency_ms >= 0);
 alter table public.call_metrics
   add constraint call_metrics_p95_turn_latency_nonneg
-    check (p95_turn_latency_ms is null or p95_turn_latency_ms >= 0) not valid;
-alter table public.call_metrics validate constraint call_metrics_p95_turn_latency_nonneg;
-
+    check (p95_turn_latency_ms is null or p95_turn_latency_ms >= 0);
 alter table public.call_metrics
   add constraint call_metrics_audio_plumbing_nonneg
-    check (audio_plumbing_ms is null or audio_plumbing_ms >= 0) not valid;
-alter table public.call_metrics validate constraint call_metrics_audio_plumbing_nonneg;
+    check (audio_plumbing_ms is null or audio_plumbing_ms >= 0);
 
 commit;
 ```
 
 Applied via `mcp__supabase__apply_migration`. Existing `idx_call_metrics_tenant_created` index covers time-series regression queries — no new index needed. RLS inherited automatically.
 
-### 4.6 Pre-existing upsert race fix
+### 4.6 Pre-existing upsert race fix (bridge path only)
 
-`call-bridge.js:589` currently uses `onConflict: "call_id", ignoreDuplicates: true`. This means if the janitor finalizes first with partial metrics, the StasisEnd path's richer row (including new latency data) is silently dropped. This is a pre-existing bug the spec inherits and fixes as part of this work:
+`call-bridge.js:589` currently uses `{ onConflict: "call_id", ignoreDuplicates: true }`. That means if the janitor wrote a sparse minimal row first (duration only), the bridge's richer `_persistFinalState` — including the new latency data — is silently dropped. This is a pre-existing bug the spec inherits and fixes **only for the bridge writer**:
 
-**Change:** switch to `{ onConflict: "call_id", ignoreDuplicates: false }` — last-writer-wins. This is safe because:
-- Both writers compute from the same CallBridge instance state when both paths fire from one bridge.
-- Latency fields are null-safe; a janitor-only finalize (no bridge) would write nulls for latency and the StasisEnd path's nulls would not overwrite real data incorrectly because in that scenario StasisEnd doesn't fire.
-- The existing non-latency fields are deterministic per-call; overwriting is idempotent.
+**Change (bridge only, `call-bridge.js:589`):** switch to `{ onConflict: "call_id", ignoreDuplicates: false }`. Bridge becomes last-writer-wins relative to the janitor.
+
+**Janitor stays unchanged (`janitor.js:112`):** keeps `{ ignoreDuplicates: true }`. Reviewer concern was "what if janitor fires after bridge and overwrites latency with NULLs?" — that cannot happen because the janitor still no-ops when a row already exists. The asymmetry is deliberate:
+
+| Order of writes | Bridge row | Janitor row | Final state |
+|---|---|---|---|
+| Bridge first, janitor second | rich (latency, etc.) | no-op (ignoreDuplicates: true) | rich — correct |
+| Janitor first, bridge second | rich, overwrites sparse | sparse (duration only) | rich — correct (new behavior) |
+| Janitor only (bridge crashed) | n/a | sparse | sparse — acceptable |
+| Bridge only (never stuck) | rich | n/a | rich — correct |
+
+All four orderings yield the richest available data with no silent drops. The change is the second row ("janitor first, bridge second"), which today drops latency data and after this change preserves it.
+
+The implementation plan must NOT touch the janitor's upsert — a test in §8 locks the janitor path's `ignoreDuplicates: true` behavior to prevent future accidental flips that would reintroduce the NULL-overwrite risk.
 
 Log the change explicitly in the commit so it's not hidden inside "latency work."
 
@@ -339,7 +346,8 @@ New file: `apps/voice-engine/test/call-bridge-latency.test.ts` (vitest).
 8. `audio_plumbing_ms` averages first-chunk samples across turns correctly
 9. Empty turn array → `avgTurnLatencyMs`, `p95TurnLatencyMs`, `audio_plumbing_ms` all null (not NaN, not 0)
 10. `turn_latencies_ms` array persisted when turns present, null when empty
-11. `percentile` helper: correct for n=1, n=5, n=20
+11. `percentile` helper: correct for n=1 (returns single value), n=2 (returns sorted[1] — i.e., p95 degenerates to max at small n — lock this behavior so a future "fix" doesn't accidentally change it), n=5, n=20
+14. Janitor path upsert locks `ignoreDuplicates: true` — regression guard that prevents an accidental flip that would reintroduce the NULL-overwrite risk described in §4.6
 12. `clampNonNegative` returns 0 for negative input (simulates backward clock jump)
 13. Latency aggregation throw in finalize is caught and does not break `call_metrics` row construction
 
