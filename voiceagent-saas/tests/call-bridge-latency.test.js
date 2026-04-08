@@ -329,3 +329,120 @@ describe("greeting_latency_ms", () => {
     expect(bridge.latency.audioPlumbingSamplesMs[0]).toBeGreaterThanOrEqual(0);
   });
 });
+
+describe("turn_latency_ms", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockElevenLabsSession.last = null;
+  });
+  const audioChunk = () => Buffer.alloc(320);
+
+  it("user_transcript isFinal sets pendingUserFinalAt", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+
+    const before = Date.now();
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "שלום",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    const after = Date.now();
+
+    expect(bridge.latency.pendingUserFinalAt).toBeGreaterThanOrEqual(before);
+    expect(bridge.latency.pendingUserFinalAt).toBeLessThanOrEqual(after);
+  });
+
+  it("user_transcript isFinal=false does NOT set pendingUserFinalAt", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "שלו...",
+      isFinal: false,
+      ts: Date.now(),
+    });
+
+    expect(bridge.latency.pendingUserFinalAt).toBe(null);
+  });
+
+  it("computes turn_latency_ms on next agent_audio after isFinal", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+
+    // Consume the greeting first.
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    expect(bridge.latency.greetingLatencyMs).not.toBe(null);
+
+    // User speaks, finalizes.
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "כן",
+      isFinal: true,
+      ts: Date.now(),
+    });
+
+    // Wait, then agent responds.
+    await new Promise((r) => setTimeout(r, 25));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    expect(bridge.latency.turnLatenciesMs[0]).toBeGreaterThanOrEqual(20);
+    expect(bridge.latency.pendingUserFinalAt).toBe(null);
+  });
+
+  it("multiple isFinal before one agent_audio → only the most recent counted", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "first",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    const firstFinalAt = bridge.latency.pendingUserFinalAt;
+
+    await new Promise((r) => setTimeout(r, 15));
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "second",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    const secondFinalAt = bridge.latency.pendingUserFinalAt;
+    expect(secondFinalAt).toBeGreaterThan(firstFinalAt);
+
+    await new Promise((r) => setTimeout(r, 15));
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    // The measured latency should be from the SECOND isFinal, so ~15ms
+    // not ~30ms.
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    expect(bridge.latency.turnLatenciesMs[0]).toBeLessThan(30);
+  });
+
+  it("subsequent agent_audio chunks in the same turn do NOT create extra samples", async () => {
+    const { bridge } = makeBridge();
+    bridge.sendToAsterisk = vi.fn();
+    await driveToLive(bridge);
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk()); // greeting
+
+    MockElevenLabsSession.last.emit("user_transcript", {
+      text: "test",
+      isFinal: true,
+      ts: Date.now(),
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+    MockElevenLabsSession.last.emit("agent_audio", audioChunk());
+
+    expect(bridge.latency.turnLatenciesMs.length).toBe(1);
+    // audio_plumbing samples: 1 from greeting + 1 from turn first chunk = 2
+    expect(bridge.latency.audioPlumbingSamplesMs.length).toBe(2);
+  });
+});

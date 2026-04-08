@@ -394,6 +394,13 @@ export class CallBridge {
     });
 
     session.on("user_transcript", ({ text, isFinal, ts }) => {
+      // Latency tracking (spec §3.2, §4.2): only the most recent isFinal
+      // counts — overwriting is intentional.
+      if (isFinal === true) {
+        this.latency.pendingUserFinalAt = Date.now();
+        this.latency.pendingUserFinalIsBarge = false;
+      }
+
       this.turnCount += 1;
       enqueueTurn({
         callId: this.callId,
