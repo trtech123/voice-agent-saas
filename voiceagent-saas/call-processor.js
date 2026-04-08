@@ -28,6 +28,22 @@ import { ComplianceGate, DncEnforcer, isWithinScheduleWindows } from "./complian
 import { executeToolCall, buildToolDefinitions } from "./tools.js";
 import { WhatsAppClient } from "./whatsapp-client.js";
 
+/**
+ * Resolve the voice pipeline for a call from campaign and tenant rows.
+ * Snapshot at dequeue time so a flag flip mid-queue cannot affect in-flight
+ * calls. Returns 'convai' or 'unbundled'.
+ *
+ * Plan 1 of 5 — call-bridge.js does NOT yet read this value. Wired in plan 5.
+ * Spec: docs/superpowers/specs/2026-04-08-unbundled-voice-pipeline-design.md §3.5
+ */
+export function resolveVoicePipeline(campaign, tenant) {
+  return (
+    campaign?.voice_pipeline ??
+    tenant?.default_voice_pipeline ??
+    "convai"
+  );
+}
+
 // ─── Constants ─────────────────────────────────────────────────────
 
 const CALL_QUEUE_NAME = "call-jobs";
@@ -533,7 +549,9 @@ async function processCallJob(job, config) {
   const enhancedScript = complianceGate.injectRecordingConsent(campaign.script || "");
 
   // -- Step 9: Start call bridge (ElevenLabs runtime) --
+  const voicePipeline = resolveVoicePipeline(campaign, tenant);
   const bridge = new CallBridge({
+    voicePipeline,
     callId,
     tenantId,
     campaignId,
