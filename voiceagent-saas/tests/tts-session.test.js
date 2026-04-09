@@ -172,3 +172,49 @@ describe("TTSSession — pushSentence", () => {
     expect(lastMockWs.sent.length).toBe(before);
   });
 });
+
+describe("TTSSession — message dispatch", () => {
+  let s;
+  beforeEach(async () => {
+    lastMockWs = null;
+    s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+  });
+
+  it("emits 'audio' Buffer for each {audio:<base64>} message", () => {
+    const audioSpy = vi.fn();
+    s.on("audio", audioSpy);
+    const pcm = Buffer.from([1, 2, 3, 4, 5, 6]);
+    lastMockWs._msg({ audio: pcm.toString("base64") });
+    expect(audioSpy).toHaveBeenCalledTimes(1);
+    const arg = audioSpy.mock.calls[0][0];
+    expect(Buffer.isBuffer(arg)).toBe(true);
+    expect(arg.equals(pcm)).toBe(true);
+  });
+
+  it("emits 'done' on isFinal:true with totalChars", () => {
+    const doneSpy = vi.fn();
+    s.on("done", doneSpy);
+    s.pushSentence("hello");
+    lastMockWs._msg({ audio: Buffer.from([1, 2]).toString("base64") });
+    lastMockWs._msg({ isFinal: true });
+    expect(doneSpy).toHaveBeenCalledTimes(1);
+    expect(doneSpy.mock.calls[0][0]).toEqual({ totalChars: 5 });
+  });
+
+  it("ignores empty audio messages", () => {
+    const audioSpy = vi.fn();
+    s.on("audio", audioSpy);
+    lastMockWs._msg({ audio: "" });
+    lastMockWs._msg({ audio: null });
+    expect(audioSpy).not.toHaveBeenCalled();
+  });
+
+  it("ignores malformed JSON without throwing", () => {
+    expect(() => {
+      lastMockWs.emit("message", Buffer.from("not json"));
+    }).not.toThrow();
+  });
+});

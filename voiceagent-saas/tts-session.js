@@ -135,7 +135,11 @@ export class TTSSession extends EventEmitter {
   _drainPending() {
     while (this._pendingSentences.length > 0) {
       const text = this._pendingSentences.shift();
-      this._sendSentenceFrame(text);
+      if (text === "__EOS__") {
+        try { this.ws.send(JSON.stringify({ text: "" })); } catch {}
+      } else {
+        this._sendSentenceFrame(text);
+      }
     }
   }
 
@@ -157,9 +161,57 @@ export class TTSSession extends EventEmitter {
       this.log.warn({ err: err.message }, "tts pushSentence send threw");
     }
   }
-  finish() { /* filled in Task 4 */ }
+  finish() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // If WS not open yet, queue an EOS sentinel — drain will send it after BOS.
+      if (!this._wsOpen) {
+        this._pendingSentences.push("__EOS__");
+      }
+      return;
+    }
+    try {
+      this.ws.send(JSON.stringify({ text: "" }));
+    } catch (err) {
+      this.log.warn({ err: err.message }, "tts finish send threw");
+    }
+  }
+
   stop() { /* filled in Task 5 */ }
-  _handleMessage(data) { /* filled in Task 4 */ }
+
+  _handleMessage(data) {
+    if (this._stopped) return;
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+    if (msg.audio && typeof msg.audio === "string" && msg.audio.length > 0) {
+      const buf = Buffer.from(msg.audio, "base64");
+      if (buf.length > 0) {
+        this._receivedAnyAudio = true;
+        if (this._firstByteTimer) {
+          clearTimeout(this._firstByteTimer);
+          this._firstByteTimer = null;
+        }
+        this.emit("audio", buf);
+      }
+      return;
+    }
+    if (msg.isFinal === true) {
+      // EL signaled end-of-synthesis. The 'done' event fires when the WS
+      // closes (which EL does immediately after isFinal). Emit done now
+      // for predictability so callers don't have to wait on close.
+      if (!this._closed) {
+        this._closed = true;
+        this.emit("done", { totalChars: this._totalChars });
+      }
+      return;
+    }
+    if (msg.error || msg.message) {
+      this.log.warn({ msg }, "tts server message");
+    }
+  }
 }
 
 export { TTSSessionError };
