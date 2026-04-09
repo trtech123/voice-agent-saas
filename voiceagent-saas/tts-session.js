@@ -157,6 +157,15 @@ export class TTSSession extends EventEmitter {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     try {
       this.ws.send(JSON.stringify({ text: text + " ", try_trigger_generation: true }));
+      // Start the first-byte watchdog on the first sentence.
+      if (!this._firstByteTimer && !this._receivedAnyAudio) {
+        this._firstByteTimer = setTimeout(() => {
+          if (this._closed || this._stopped) return;
+          if (this._receivedAnyAudio) return;
+          this.log.warn("tts first-byte watchdog timeout");
+          this.emit("error", new TTSSessionError("first byte timeout", "tts_first_byte_timeout"));
+        }, FIRST_BYTE_TIMEOUT_MS);
+      }
     } catch (err) {
       this.log.warn({ err: err.message }, "tts pushSentence send threw");
     }

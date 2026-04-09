@@ -265,3 +265,35 @@ describe("TTSSession — stop()", () => {
     expect(stoppedSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("TTSSession — first-byte watchdog", () => {
+  beforeEach(() => { lastMockWs = null; vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("emits error tts_first_byte_timeout if no audio in 5s after first sentence", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    const errSpy = vi.fn();
+    s.on("error", errSpy);
+    s.pushSentence("hello");
+    await vi.advanceTimersByTimeAsync(5500);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(errSpy.mock.calls[0][0].code).toBe("tts_first_byte_timeout");
+  });
+
+  it("does NOT fire if audio arrives within 5s", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    const errSpy = vi.fn();
+    s.on("error", errSpy);
+    s.pushSentence("hello");
+    await vi.advanceTimersByTimeAsync(2000);
+    lastMockWs._msg({ audio: Buffer.from([1, 2]).toString("base64") });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+});
