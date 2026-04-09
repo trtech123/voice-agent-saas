@@ -62,7 +62,80 @@ export class TTSSession extends EventEmitter {
     this._receivedAnyAudio = false;
   }
 
-  async start() { /* filled in Task 2 */ }
+  async start() {
+    return this._connectWithRetry(0);
+  }
+
+  _connectWithRetry(attempt) {
+    return new Promise((resolve, reject) => {
+      const params = new URLSearchParams({
+        model_id: this.modelId,
+        output_format: DEFAULT_OUTPUT_FORMAT,
+        optimize_streaming_latency: String(this.optimizeStreamingLatency),
+      });
+      const url = `${EL_BASE}/${this.voiceId}/stream-input?${params.toString()}`;
+      this.log.info({ url, attempt }, "TTS WS connecting");
+      let ws;
+      try {
+        ws = new WebSocket(url, { headers: { "xi-api-key": this.apiKey } });
+      } catch (err) {
+        reject(new TTSSessionError(`construct: ${err.message}`, "tts_init_failed"));
+        return;
+      }
+      this.ws = ws;
+
+      const onErr = (err) => {
+        ws.removeListener("open", onOpen);
+        if (attempt < 1) {
+          this.log.warn({ err: err.message }, "TTS WS first attempt failed, retrying");
+          setTimeout(() => {
+            this._connectWithRetry(attempt + 1).then(resolve, reject);
+          }, CONNECT_RETRY_DELAY_MS);
+          return;
+        }
+        reject(new TTSSessionError(`tts init failed: ${err.message}`, "tts_init_failed"));
+      };
+      const onOpen = () => {
+        ws.removeListener("error", onErr);
+        this._wsOpen = true;
+        this.log.info("TTS WS open");
+        // Send BOS frame
+        const bos = {
+          text: " ",
+          voice_settings: this.voiceSettings,
+          xi_api_key: this.apiKey, // footgun: required in body too per EL protocol
+        };
+        try {
+          ws.send(JSON.stringify(bos));
+        } catch (e) {
+          reject(new TTSSessionError(`bos send failed: ${e.message}`, "tts_init_failed"));
+          return;
+        }
+        // Wire runtime handlers
+        ws.on("message", (data) => this._handleMessage(data));
+        ws.on("close", (code, reasonBuf) => {
+          if (this._closed || this._stopped) return;
+          this.emit("done", { totalChars: this._totalChars });
+          this._closed = true;
+        });
+        ws.on("error", (err) => {
+          if (this._closed || this._stopped) return;
+          this.log.error({ err: err.message }, "TTS WS runtime error");
+          this.emit("error", new TTSSessionError(`runtime: ${err.message}`, "tts_failed"));
+        });
+        // Drain any pre-open buffered sentences
+        this._drainPending();
+        resolve();
+      };
+      ws.once("open", onOpen);
+      ws.once("error", onErr);
+    });
+  }
+
+  _drainPending() {
+    // Filled in by Task 3 when pushSentence() exists.
+  }
+
   pushSentence(text) { /* filled in Task 3 */ }
   finish() { /* filled in Task 4 */ }
   stop() { /* filled in Task 5 */ }

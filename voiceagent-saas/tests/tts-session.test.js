@@ -55,3 +55,67 @@ describe("TTSSession — constructor", () => {
     expect(s.modelId).toBe("eleven_turbo_v2_5");
   });
 });
+
+describe("TTSSession — start()", () => {
+  beforeEach(() => { lastMockWs = null; });
+
+  it("opens WS to the correct URL with model_id=eleven_turbo_v2_5", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v123", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.url).toContain("/v1/text-to-speech/v123/stream-input");
+    expect(lastMockWs.url).toContain("model_id=eleven_turbo_v2_5");
+    expect(lastMockWs.url).toContain("output_format=pcm_16000");
+    expect(lastMockWs.url).toContain("optimize_streaming_latency=3");
+  });
+
+  it("sends xi-api-key header", async () => {
+    const s = new TTSSession({ apiKey: "my-key", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.opts.headers["xi-api-key"]).toBe("my-key");
+  });
+
+  it("sends BOS frame containing voice_settings AND xi_api_key in body", async () => {
+    const s = new TTSSession({ apiKey: "key1", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    expect(lastMockWs.sent.length).toBeGreaterThanOrEqual(1);
+    const bos = JSON.parse(lastMockWs.sent[0]);
+    expect(bos.text).toBe(" ");
+    expect(bos.voice_settings).toEqual({ stability: 0.5, similarity_boost: 0.8, speed: 1.0 });
+    expect(bos.xi_api_key).toBe("key1"); // EL footgun: required in body too
+  });
+
+  it("retries once on initial WS error after 300ms", async () => {
+    vi.useFakeTimers();
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    const firstWs = lastMockWs;
+    firstWs.emit("error", new Error("connect failed"));
+    // Should construct a new WS after ~300ms
+    await vi.advanceTimersByTimeAsync(350);
+    expect(lastMockWs).not.toBe(firstWs);
+    lastMockWs._open();
+    await vi.runAllTimersAsync();
+    await p;
+    vi.useRealTimers();
+  });
+
+  it("rejects with tts_init_failed if both attempts fail", async () => {
+    vi.useFakeTimers();
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs.emit("error", new Error("connect failed"));
+    await vi.advanceTimersByTimeAsync(350);
+    lastMockWs.emit("error", new Error("connect failed again"));
+    let err;
+    try { await p; } catch (e) { err = e; }
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("tts_init_failed");
+    vi.useRealTimers();
+  });
+});
