@@ -328,19 +328,146 @@ export class UnbundledPipeline extends EventEmitter {
     if (this._dg) this._dg.sendAudio(buffer);
   }
 
-  /** Called by call-bridge when our VAD commits a user turn. */
-  async commitUserTurn(source) {
-    // Filled in by Task 4-7.
+  /**
+   * Called by call-bridge when our VAD commits a user turn (or by the
+   * Deepgram utterance_end failover after 500ms of no VAD commit).
+   */
+  async commitUserTurn(source = "our_vad") {
+    if (this._state !== STATE.LISTENING) {
+      this.log.debug({ state: this._state }, "commitUserTurn ignored — not listening");
+      return;
+    }
+    const transcript = (this._latestPartialText || "").trim();
+    if (!transcript) {
+      this.log.warn("commitUserTurn but no transcript available");
+      return;
+    }
+    this._latestPartialText = "";
+    const userTurnAt = Date.now();
+    this._setState(STATE.PROCESSING);
+
+    // Append user turn to history
+    this._messages.push({ role: "user", content: transcript });
+    this._applySlidingWindow();
+
+    // Emit synthetic user_transcript so call-bridge.js latency tracker
+    // sees ONE event per committed turn (matches the ElevenLabs path).
+    this.emit("user_transcript", { text: transcript, isFinal: true, ts: userTurnAt });
+
+    // Run the LLM
+    if (this._roundCountThisCall >= LLM_MAX_ROUNDS_PER_CALL) {
+      this.log.error("LLM round budget exhausted for this call");
+      this.emit("error", new UnbundledPipelineError("llm round budget exhausted", "llm_round_budget_exhausted"));
+      await this._playErrorAndClose("llm_round_budget_exhausted");
+      return;
+    }
+
+    const llmAbort = new AbortController();
+    this._currentLlmAbort = llmAbort;
+
+    const llm = new LLMSession({
+      apiKey: this.apiKeys.openai,
+      logger: this.log.child ? this.log.child({ component: "llm" }) : this.log,
+      toolSchema: buildOpenAIToolSchema(),
+      abortSignal: llmAbort.signal,
+    });
+    this._currentLlm = llm;
+
+    // Open a fresh TTS session for this turn
+    const tts = new TTSSession({
+      apiKey: this.apiKeys.elevenlabs,
+      voiceId: VOICE_ID,
+      logger: this.log.child ? this.log.child({ component: "tts" }) : this.log,
+    });
+    this._currentTts = tts;
+    this._wireTtsHandlers(tts);
+    let ttsStarted = false;
+    const ttsStartPromise = tts.start().then(() => { ttsStarted = true; }).catch((err) => {
+      this.log.error({ err: err.message }, "tts start failed mid-turn");
+      this.emit("error", err);
+    });
+    // Don't await — TTS opens in parallel with LLM streaming. pushSentence
+    // buffers internally until WS is open.
+
+    this._setState(STATE.SPEAKING);
+
+    let firstSentenceAt = null;
+    let agentResponseText = "";
+
+    try {
+      for await (const ev of llm.run(this._messages)) {
+        if (ev.type === "sentence") {
+          if (!firstSentenceAt) {
+            firstSentenceAt = Date.now();
+            this.metrics.llmFirstSentenceMsSamples.push(firstSentenceAt - userTurnAt);
+            // Total turn latency = first agent audio reaches caller, NOT first
+            // sentence emit. We measure this in _wireTtsHandlers via
+            // _lastTtsAudioAt. As a proxy here, we record llmFirstSentenceMs
+            // and let call-bridge merge with TTS first-byte for total.
+          }
+          tts.pushSentence(ev.text);
+          agentResponseText += (agentResponseText ? " " : "") + ev.text;
+        } else if (ev.type === "tool_call_request") {
+          // Tool loop — Task 5
+          await this._handleToolCall(ev, llm);
+        } else if (ev.type === "usage") {
+          this.metrics.llmTokensIn += ev.tokens_in;
+          this.metrics.llmTokensOut += ev.tokens_out;
+        } else if (ev.type === "done") {
+          // LLM done — finish TTS so it knows no more sentences are coming
+          tts.finish();
+        }
+      }
+    } catch (err) {
+      this.log.error({ err: err.message, code: err.code }, "llm run failed");
+      const code = err.code || "llm_failed";
+      this.emit("error", new UnbundledPipelineError(err.message, code));
+      await this._playErrorAndClose(code);
+      return;
+    }
+
+    // Append the assistant text to history
+    if (agentResponseText) {
+      this._messages.push({ role: "assistant", content: agentResponseText });
+      this.emit("agent_response", { text: agentResponseText, isFinal: true, ts: Date.now() });
+    }
+    this.metrics.ttsCharsSynthesized += agentResponseText.length;
+    this._currentLlm = null;
+    this._currentLlmAbort = null;
+    this._roundCountThisCall += 1;
+    // State transitions back to LISTENING via the TTS 'done' handler.
   }
 
-  /** Called when Deepgram emits utterance_end (failover). */
+  _applySlidingWindow() {
+    // Keep system + last LLM_HISTORY_WINDOW_TURNS user/assistant turn pairs.
+    const system = this._messages[0]?.role === "system" ? this._messages[0] : null;
+    const rest = system ? this._messages.slice(1) : this._messages;
+    if (rest.length <= LLM_HISTORY_WINDOW_TURNS * 2) return;
+    const trimmed = rest.slice(-LLM_HISTORY_WINDOW_TURNS * 2);
+    this._messages = system ? [system, ...trimmed] : trimmed;
+  }
+
   _handleUtteranceEndFailover() {
-    // Filled in by Task 4.
+    // If our VAD has not committed within 500ms, commit using Deepgram's signal.
+    // For now (without VAD wired in), this is a no-op stub. Wired up in Task 7
+    // when call-bridge actually drives commitUserTurn.
+  }
+
+  async _handleToolCall(req, llm) {
+    // Filled in by Task 5.
+  }
+
+  async _playErrorAndClose(reason) {
+    if (_errorPcm.length > 0) {
+      this.emit("agent_audio", _errorPcm);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    this.close(reason);
   }
 
   /** Called by Deepgram partial handler — evaluates the barge gate. */
   _evaluateBargeGate(partial) {
-    // Filled in by Task 8.
+    // Filled in by Task 6.
   }
 
   /** Clean up everything. Idempotent. */
