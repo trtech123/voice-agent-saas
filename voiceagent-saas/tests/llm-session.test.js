@@ -213,3 +213,74 @@ describe("LLMSession — tool calls", () => {
     expect(lastBody.tool_choice).toBe("none");
   });
 });
+
+describe("LLMSession — retry policy", () => {
+  beforeEach(() => { __setFetchForTests(null); });
+
+  it("retries once on a 5xx then succeeds", async () => {
+    let callCount = 0;
+    __setFetchForTests(async () => {
+      callCount++;
+      if (callCount === 1) return new Response("server error", { status: 503 });
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger() });
+    const yielded = [];
+    for await (const ev of s.run([{ role: "user", content: "hi" }])) yielded.push(ev);
+    expect(callCount).toBe(2);
+    expect(yielded.find((e) => e.type === "done")).toBeTruthy();
+  });
+
+  it("retries twice on 5xx then fails with llm_failed", async () => {
+    let callCount = 0;
+    __setFetchForTests(async () => {
+      callCount++;
+      return new Response("server error", { status: 500 });
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger() });
+    const gen = s.run([{ role: "user", content: "hi" }]);
+    let err;
+    try {
+      for await (const ev of gen) {}
+    } catch (e) {
+      err = e;
+    }
+    expect(callCount).toBe(3); // initial + 2 retries
+    expect(err).toBeTruthy();
+    expect(err.code).toBe("llm_failed");
+  });
+
+  it("honors retry-after header on 429", async () => {
+    let callCount = 0;
+    let firstRetryAt = null;
+    const t0 = Date.now();
+    __setFetchForTests(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "1" } });
+      }
+      firstRetryAt = Date.now();
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger() });
+    for await (const ev of s.run([{ role: "user", content: "hi" }])) {}
+    const delta = firstRetryAt - t0;
+    expect(delta).toBeGreaterThanOrEqual(900); // ~1s retry-after
+    expect(delta).toBeLessThan(2500);
+  });
+
+  it("does NOT retry on 4xx (non-429)", async () => {
+    let callCount = 0;
+    __setFetchForTests(async () => {
+      callCount++;
+      return new Response("bad request", { status: 400 });
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger() });
+    let err;
+    try {
+      for await (const ev of s.run([{ role: "user", content: "hi" }])) {}
+    } catch (e) { err = e; }
+    expect(callCount).toBe(1);
+    expect(err.code).toBe("llm_bad_request");
+  });
+});

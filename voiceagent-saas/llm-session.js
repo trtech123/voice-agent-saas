@@ -168,6 +168,34 @@ export class LLMSession {
   }
 
   async _streamRound(messages, forceNoTools = false) {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await this._streamRoundOnce(messages, forceNoTools);
+      } catch (err) {
+        lastErr = err;
+        const code = err.code;
+        // Retry policy
+        if (code === "llm_bad_request") throw err;          // 4xx (non-429): no retry
+        if (attempt >= 2) throw err;                        // out of retries
+        if (code === "llm_rate_limited") {
+          // Honor retry-after if present
+          const ra = err.retryAfterMs ?? 1000;
+          await new Promise((r) => setTimeout(r, ra));
+        } else if (code === "llm_failed") {
+          // 5xx: exponential backoff
+          await new Promise((r) => setTimeout(r, attempt === 0 ? 250 : 750));
+        } else {
+          // Network etc — single short retry then fail
+          if (attempt >= 1) throw err;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  async _streamRoundOnce(messages, forceNoTools) {
     this._roundCount += 1;
     this._fullText = "";
     const body = {
@@ -202,6 +230,12 @@ export class LLMSession {
         this._classifyHttpError(res.status),
       );
       err.status = res.status;
+      // Parse retry-after if present
+      const ra = res.headers.get("retry-after");
+      if (ra) {
+        const seconds = parseFloat(ra);
+        if (!isNaN(seconds)) err.retryAfterMs = Math.min(2000, seconds * 1000);
+      }
       throw err;
     }
     return res.body;
