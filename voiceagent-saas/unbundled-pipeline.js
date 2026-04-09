@@ -534,7 +534,57 @@ export class UnbundledPipeline extends EventEmitter {
 
   /** Called by Deepgram partial handler — evaluates the barge gate. */
   _evaluateBargeGate(partial) {
-    // Filled in by Task 6.
+    if (this._state !== STATE.SPEAKING && this._state !== STATE.PROCESSING) return;
+    const text = (partial.text || "").trim();
+    if (text.length < BARGE_GATE_MIN_CHARS) {
+      this.log.debug({ text }, "barge gate blocked: too short");
+      return;
+    }
+    const sinceLastTtsAudio = Date.now() - this._lastTtsAudioAt;
+    if (sinceLastTtsAudio < DEEPGRAM_BARGE_GATE_MS) {
+      this.log.debug({ sinceLastTtsAudio }, "barge gate blocked: within echo tail");
+      return;
+    }
+
+    // Gate passes — execute the barge.
+    const bargeStart = Date.now();
+    this.metrics.bargeCount += 1;
+    this._bargeTimestamps.push(bargeStart);
+    this._evictOldBargeTimestamps();
+
+    if (this._bargeTimestamps.length > BARGE_LOOP_THRESHOLD) {
+      this.log.error("barge loop detected");
+      this.emit("error", new UnbundledPipelineError("barge loop", "barge_loop_detected"));
+      this._playErrorAndClose("barge_loop_detected");
+      return;
+    }
+
+    this._setState(STATE.BARGING);
+
+    // Strict stop order per spec: abort LLM, stop TTS, flush media-bridge.
+    if (this._currentLlmAbort) {
+      try { this._currentLlmAbort.abort(); } catch {}
+      this._currentLlmAbort = null;
+    }
+    if (this._currentTts) {
+      try { this._currentTts.stop(); } catch {}
+      this._currentTts = null;
+    }
+    // The media-bridge flush is owned by call-bridge.js — emit interruption
+    // so it knows to flush its outbound buffer.
+    this.emit("interruption", { ts: bargeStart });
+
+    this.metrics.bargeResponseMs = Date.now() - bargeStart;
+    this._setState(STATE.LISTENING);
+    // The triggering partial becomes the seed for the next turn — already
+    // captured in _latestPartialText.
+  }
+
+  _evictOldBargeTimestamps() {
+    const cutoff = Date.now() - BARGE_LOOP_WINDOW_MS;
+    while (this._bargeTimestamps.length > 0 && this._bargeTimestamps[0] < cutoff) {
+      this._bargeTimestamps.shift();
+    }
   }
 
   /** Clean up everything. Idempotent. */
