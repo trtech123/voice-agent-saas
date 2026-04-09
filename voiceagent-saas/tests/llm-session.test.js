@@ -284,3 +284,29 @@ describe("LLMSession — retry policy", () => {
     expect(err.code).toBe("llm_bad_request");
   });
 });
+
+describe("LLMSession — abort signal", () => {
+  beforeEach(() => { __setFetchForTests(null); });
+
+  it("aborts the in-flight fetch when the external signal fires", async () => {
+    let abortReceived = false;
+    __setFetchForTests(async (url, opts) => {
+      return new Promise((_, reject) => {
+        opts.signal.addEventListener("abort", () => {
+          abortReceived = true;
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    });
+    const ac = new AbortController();
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger(), abortSignal: ac.signal });
+    const gen = s.run([{ role: "user", content: "hi" }]);
+    setTimeout(() => ac.abort(), 50);
+    let err;
+    try {
+      for await (const ev of gen) {}
+    } catch (e) { err = e; }
+    expect(abortReceived).toBe(true);
+    expect(err).toBeTruthy();
+  });
+});
