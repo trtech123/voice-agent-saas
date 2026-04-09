@@ -243,7 +243,84 @@ export class UnbundledPipeline extends EventEmitter {
 
   /** Begin the conversation: synthesize the greeting and inject as turn 0. */
   async startConversation() {
-    // Filled in by Task 3.
+    if (this._state !== STATE.CONNECTED) {
+      this.log.warn({ state: this._state }, "startConversation() called in unexpected state");
+      return;
+    }
+    // 1. Build the system prompt + first message from the campaign row
+    const dynamicVariables = {
+      contact_name: this.contact?.name || "",
+      business_name: this.tenant?.name || "",
+      ...(this.contact?.custom_fields || {}),
+    };
+    const { systemPrompt, firstMessage } = buildFromCampaign({
+      systemPrompt: this.campaign?.system_prompt,
+      firstMessage: this.campaign?.first_message,
+      dynamicVariables,
+    });
+
+    if (!systemPrompt || !firstMessage) {
+      this.log.error("campaign missing system_prompt or first_message — cannot start unbundled conversation");
+      this.emit("error", new UnbundledPipelineError("missing prompt/first_message", "campaign_misconfigured"));
+      this.close("campaign_misconfigured");
+      return;
+    }
+
+    // 2. Initialize dialogue history
+    this._messages = [
+      { role: "system", content: systemPrompt },
+      { role: "assistant", content: firstMessage },
+    ];
+
+    // 3. Play the greeting through a fresh TTSSession
+    this._setState(STATE.GREETING);
+    const tts = new TTSSession({
+      apiKey: this.apiKeys.elevenlabs,
+      voiceId: VOICE_ID,
+      logger: this.log.child ? this.log.child({ component: "tts" }) : this.log,
+    });
+    this._currentTts = tts;
+    this._wireTtsHandlers(tts);
+    try {
+      await tts.start();
+    } catch (err) {
+      this.log.error({ err: err.message }, "tts start failed during greeting");
+      this.emit("error", new UnbundledPipelineError("tts init failed", "tts_init_failed"));
+      this.close("tts_init_failed");
+      return;
+    }
+    tts.pushSentence(firstMessage);
+    tts.finish();
+
+    // Emit agent_response so live-turn-writer persists turn 0
+    this.emit("agent_response", { text: firstMessage, isFinal: true, ts: Date.now() });
+    this.metrics.ttsCharsSynthesized += firstMessage.length;
+  }
+
+  _wireTtsHandlers(tts) {
+    tts.on("audio", (buf) => {
+      this._lastTtsAudioAt = Date.now();
+      this.emit("agent_audio", buf);
+    });
+    tts.on("done", (e) => {
+      // Greeting → LISTENING. Subsequent agent responses also → LISTENING.
+      if (this._state === STATE.GREETING || this._state === STATE.SPEAKING) {
+        this._setState(STATE.LISTENING);
+      }
+      if (e?.totalChars) this.metrics.ttsCharsSynthesized += 0; // already counted on push
+    });
+    tts.on("stopped", () => {
+      // No-op; the BARGING transition is driven by _evaluateBargeGate.
+    });
+    tts.on("error", (err) => {
+      this.log.error({ err: err.message, code: err.code }, "tts error");
+      // For mid-stream failures after audio played, log warning and continue.
+      // For init failures, fail the call.
+      if (err.code === "tts_init_failed" || err.code === "tts_first_byte_timeout") {
+        this.emit("error", err);
+        this.close(err.code);
+      }
+    });
   }
 
   /** Forward a 20ms slin16 frame to Deepgram. */
