@@ -98,8 +98,169 @@ export class LLMSession {
    * before continuing. The orchestrator (plan 5) drives this loop.
    */
   async *run(messages) {
-    // Filled in by Task 4.
-    yield { type: "done", fullText: "", totalTokensIn: 0, totalTokensOut: 0 };
+    // For now, single-round (no tool loop). Tool loop added in Task 5.
+    const stream = await this._streamRound(messages);
+    yield* this._iterateStream(stream);
+    yield {
+      type: "done",
+      fullText: this._fullText,
+      totalTokensIn: this._totalTokensIn,
+      totalTokensOut: this._totalTokensOut,
+    };
+  }
+
+  async _streamRound(messages) {
+    this._roundCount += 1;
+    this._fullText = "";
+    const body = {
+      model: this.model,
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: this.maxTokens,
+      temperature: 0,
+    };
+    if (this.toolSchema && this.toolSchema.length > 0) {
+      body.tools = this.toolSchema;
+      body.tool_choice = "auto";
+    }
+
+    const ac = new AbortController();
+    if (this.abortSignal) {
+      this.abortSignal.addEventListener("abort", () => ac.abort(), { once: true });
+    }
+
+    const res = await _fetch(OPENAI_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      const err = new LLMSessionError(`OpenAI HTTP ${res.status}: ${text.slice(0, 200)}`, this._classifyHttpError(res.status));
+      err.status = res.status;
+      throw err;
+    }
+    return res.body;
+  }
+
+  _classifyHttpError(status) {
+    if (status === 429) return "llm_rate_limited";
+    if (status >= 500) return "llm_failed";
+    return "llm_bad_request";
+  }
+
+  /**
+   * Async generator that consumes the OpenAI SSE stream and yields tagged
+   * objects (sentence / tool_call_request / usage). Updates this._fullText,
+   * this._totalTokensIn, this._totalTokensOut as a side-effect.
+   */
+  async *_iterateStream(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let sentenceBuf = "";
+    let firstSentenceEmitted = false;
+    let lastTokenAt = Date.now();
+    // Tool-call accumulator: index → { id, name, argsText }
+    const toolAcc = new Map();
+    let finishReason = null;
+
+    const tryFlushSentence = (force = false) => {
+      const text = sentenceBuf.trim();
+      if (!text) return null;
+      const wordCount = text.split(/\s+/).filter(Boolean).length;
+      const hasBoundary = SENTENCE_BOUNDARY.test(sentenceBuf);
+      if (force || hasBoundary) {
+        // First sentence bypasses min-word check
+        if (firstSentenceEmitted && !force && wordCount < MIN_SENTENCE_WORDS_AFTER_FIRST) {
+          return null; // wait for more tokens
+        }
+        sentenceBuf = "";
+        firstSentenceEmitted = true;
+        return text;
+      }
+      return null;
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        // Process complete SSE events
+        let nl;
+        while ((nl = buf.indexOf("\n\n")) !== -1) {
+          const event = buf.slice(0, nl);
+          buf = buf.slice(nl + 2);
+          if (!event.startsWith("data: ")) continue;
+          const payload = event.slice(6);
+          if (payload === "[DONE]") {
+            const flushed = tryFlushSentence(true);
+            if (flushed) yield { type: "sentence", text: flushed };
+            return; // generator done
+          }
+          let json;
+          try {
+            json = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          // Usage event (separate chunk per OpenAI's stream_options)
+          if (json.usage) {
+            this._totalTokensIn = json.usage.prompt_tokens || 0;
+            this._totalTokensOut = json.usage.completion_tokens || 0;
+            yield { type: "usage", tokens_in: this._totalTokensIn, tokens_out: this._totalTokensOut };
+          }
+          const choice = json.choices?.[0];
+          if (!choice) continue;
+          // Track finish_reason
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+          // Content delta
+          const contentDelta = choice.delta?.content;
+          if (contentDelta) {
+            sentenceBuf += contentDelta;
+            this._fullText += contentDelta;
+            lastTokenAt = Date.now();
+            const flushed = tryFlushSentence(false);
+            if (flushed) yield { type: "sentence", text: flushed };
+          }
+          // Tool-call deltas (Task 5 will yield these)
+          const tcDeltas = choice.delta?.tool_calls;
+          if (tcDeltas) {
+            for (const tc of tcDeltas) {
+              const idx = tc.index ?? 0;
+              if (!toolAcc.has(idx)) {
+                toolAcc.set(idx, { id: null, name: null, argsText: "" });
+              }
+              const acc = toolAcc.get(idx);
+              if (tc.id) acc.id = tc.id;
+              if (tc.function?.name) acc.name = tc.function.name;
+              if (tc.function?.arguments) acc.argsText += tc.function.arguments;
+            }
+          }
+        }
+        // Max-buffer-ms flush: if we haven't seen a token in 200ms AND have
+        // a buffer, flush it as a sentence even without a boundary.
+        if (Date.now() - lastTokenAt > MAX_BUFFER_MS_NO_TOKENS && sentenceBuf.trim()) {
+          const flushed = tryFlushSentence(true);
+          if (flushed) yield { type: "sentence", text: flushed };
+        }
+      }
+      // Stream ended without [DONE] — flush whatever's left.
+      const flushed = tryFlushSentence(true);
+      if (flushed) yield { type: "sentence", text: flushed };
+      // Stash tool calls + finish reason for the orchestrator (Task 5 wires this in).
+      this._lastToolAcc = toolAcc;
+      this._lastFinishReason = finishReason;
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
   }
 
   /**
