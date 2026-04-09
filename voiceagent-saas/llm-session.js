@@ -175,6 +175,8 @@ export class LLMSession {
       } catch (err) {
         lastErr = err;
         const code = err.code;
+        // Abort: never retry
+        if (err.name === "AbortError") throw err;
         // Retry policy
         if (code === "llm_bad_request") throw err;          // 4xx (non-429): no retry
         if (attempt >= 2) throw err;                        // out of retries
