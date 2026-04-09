@@ -22,6 +22,7 @@
  */
 
 import { ElevenLabsSession } from "./elevenlabs-session.js";
+import { UnbundledPipeline } from "./unbundled-pipeline.js";
 import { enqueueTurn, flushAndClose } from "./live-turn-writer.js";
 import { executeToolCall } from "./tools.js";
 import { createSilenceDetector } from "./vad.js";
@@ -304,22 +305,41 @@ export class CallBridge {
 
     let session;
     try {
-      session = new ElevenLabsSession({
-        agentId: agentIdUsed,
-        conversationConfig: {
-          dynamicVariables,
-          // first_message override only if campaign provides one
-          ...(this.cfg.campaign?.first_message
-            ? { firstMessage: this.cfg.campaign.first_message }
-            : {}),
-        },
-        logger: this.log.child
-          ? this.log.child({ component: "el-session", agentId: agentIdUsed })
-          : this.log,
-      });
+      if (this.cfg.voicePipeline === "unbundled") {
+        session = new UnbundledPipeline({
+          tenantId: this.tenantId,
+          callId: this.callId,
+          campaign: this.cfg.campaign,
+          contact: this.cfg.contact,
+          tenant: this.cfg.tenant,
+          apiKeys: {
+            deepgram: process.env.DEEPGRAM_API_KEY,
+            openai: process.env.OPENAI_API_KEY,
+            elevenlabs: process.env.ELEVENLABS_API_KEY,
+          },
+          logger: this.log.child
+            ? this.log.child({ component: "unbundled-pipeline" })
+            : this.log,
+          toolContext: { /* unchanged from convai path */ },
+        });
+      } else {
+        session = new ElevenLabsSession({
+          agentId: agentIdUsed,
+          conversationConfig: {
+            dynamicVariables,
+            // first_message override only if campaign provides one
+            ...(this.cfg.campaign?.first_message
+              ? { firstMessage: this.cfg.campaign.first_message }
+              : {}),
+          },
+          logger: this.log.child
+            ? this.log.child({ component: "el-session", agentId: agentIdUsed })
+            : this.log,
+        });
+      }
     } catch (err) {
-      this.log.error({ err }, "ElevenLabsSession constructor threw");
-      await this._finalizeAndResolve("el_construct_failed", "el_ws_connect_failed");
+      this.log.error({ err }, "voice session constructor threw");
+      await this._finalizeAndResolve("session_construct_failed", "el_ws_connect_failed");
       return;
     }
 
@@ -751,6 +771,26 @@ export class CallBridge {
     } catch (err) {
       this.log.error({ err }, "vad.pushChunk threw");
     }
+
+    // Unbundled pipeline: drive turn commit from our VAD.
+    this._commitUserTurnIfUnbundled();
+  }
+
+  /**
+   * Called from the VAD frame loop OR from a periodic timer when the VAD
+   * commits a user turn. On the unbundled path, drives the LLM round.
+   * On the convai path, this method is a no-op (EL handles turn detection).
+   */
+  _commitUserTurnIfUnbundled() {
+    if (this.cfg.voicePipeline !== "unbundled") return;
+    if (typeof this.session?.commitUserTurn !== "function") return;
+    if (!this.vad) return;
+    const userStoppedAt = this.vad.getUserStoppedAt();
+    if (userStoppedAt == null) return;
+    this.vad.reset();
+    this.session.commitUserTurn("our_vad").catch((err) => {
+      this.log.error({ err }, "unbundled commitUserTurn threw");
+    });
   }
 
   // ─── Bridge Lifecycle ───────────────────────────────────────────
