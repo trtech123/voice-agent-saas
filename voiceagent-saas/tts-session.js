@@ -133,10 +133,30 @@ export class TTSSession extends EventEmitter {
   }
 
   _drainPending() {
-    // Filled in by Task 3 when pushSentence() exists.
+    while (this._pendingSentences.length > 0) {
+      const text = this._pendingSentences.shift();
+      this._sendSentenceFrame(text);
+    }
   }
 
-  pushSentence(text) { /* filled in Task 3 */ }
+  pushSentence(text) {
+    if (!text || !text.trim()) return;
+    this._totalChars += text.length;
+    if (!this._wsOpen) {
+      this._pendingSentences.push(text);
+      return;
+    }
+    this._sendSentenceFrame(text);
+  }
+
+  _sendSentenceFrame(text) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ text: text + " ", try_trigger_generation: true }));
+    } catch (err) {
+      this.log.warn({ err: err.message }, "tts pushSentence send threw");
+    }
+  }
   finish() { /* filled in Task 4 */ }
   stop() { /* filled in Task 5 */ }
   _handleMessage(data) { /* filled in Task 4 */ }

@@ -119,3 +119,56 @@ describe("TTSSession — start()", () => {
     vi.useRealTimers();
   });
 });
+
+describe("TTSSession — pushSentence", () => {
+  beforeEach(() => { lastMockWs = null; });
+
+  it("queues sentences pushed before WS opens, drains on open", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    s.pushSentence("first sentence");
+    s.pushSentence("second sentence");
+    expect(lastMockWs.sent.length).toBe(0); // not opened yet, nothing sent
+    lastMockWs._open();
+    await p;
+    // After open: BOS + 2 sentences = 3 sends
+    expect(lastMockWs.sent.length).toBe(3);
+    const sentences = lastMockWs.sent.slice(1).map((s) => JSON.parse(s));
+    expect(sentences[0].text).toBe("first sentence ");
+    expect(sentences[0].try_trigger_generation).toBe(true);
+    expect(sentences[1].text).toBe("second sentence ");
+  });
+
+  it("forwards sentences immediately when WS is already open", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    s.pushSentence("hello world");
+    // BOS + sentence
+    expect(lastMockWs.sent.length).toBe(2);
+    const last = JSON.parse(lastMockWs.sent[1]);
+    expect(last.text).toBe("hello world ");
+  });
+
+  it("tracks totalChars across all pushed sentences", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    s.pushSentence("שלום");      // 4 chars
+    s.pushSentence("איך אתה?");   // 8 chars
+    expect(s._totalChars).toBe(4 + 8);
+  });
+
+  it("ignores empty/whitespace pushSentence calls", async () => {
+    const s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+    const before = lastMockWs.sent.length;
+    s.pushSentence("");
+    s.pushSentence("   ");
+    expect(lastMockWs.sent.length).toBe(before);
+  });
+});
