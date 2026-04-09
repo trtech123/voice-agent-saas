@@ -17,8 +17,10 @@ const DEFAULT_MODEL = "gpt-4o-mini";
 
 // Sentence boundary regex covering Latin and Hebrew/Arabic punctuation.
 // Matches when the buffer ends with a sentence-terminating mark followed
-// by optional whitespace.
-const SENTENCE_BOUNDARY = /[.!?،؟]\s*$/u;
+// by at least one whitespace character (indicating the model has moved on
+// to the next sentence). Terminal punctuation without trailing space only
+// flushes at [DONE] or via the max-buffer-ms timer.
+const SENTENCE_BOUNDARY = /[.!?،؟]\s+$/u;
 
 const FIRST_ROUND_TIMEOUT_MS = 8000;
 const TOTAL_ROUND_BUDGET_MS = 15000;
@@ -98,9 +100,65 @@ export class LLMSession {
    * before continuing. The orchestrator (plan 5) drives this loop.
    */
   async *run(messages) {
-    // For now, single-round (no tool loop). Tool loop added in Task 5.
-    const stream = await this._streamRound(messages);
-    yield* this._iterateStream(stream);
+    let workingMessages = [...messages];
+
+    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+      this._lastToolAcc = new Map();
+      this._lastFinishReason = null;
+
+      const forceNoTools = round >= MAX_TOOL_ROUNDS;
+      const stream = await this._streamRound(workingMessages, forceNoTools);
+      yield* this._iterateStream(stream);
+
+      const toolAcc = this._lastToolAcc;
+      const finishReason = this._lastFinishReason;
+      if (finishReason !== "tool_calls" || toolAcc.size === 0) break;
+
+      // Build assistant message that captures the model's tool_calls (required
+      // by OpenAI to be present in history before the corresponding tool messages).
+      const assistantMsg = { role: "assistant", content: null, tool_calls: [] };
+      const toolResults = [];
+      const realCalls = [];
+
+      for (const [, acc] of toolAcc) {
+        if (!acc.id || !acc.name) continue;
+        assistantMsg.tool_calls.push({
+          id: acc.id,
+          type: "function",
+          function: { name: acc.name, arguments: acc.argsText },
+        });
+        let parsed;
+        try {
+          parsed = JSON.parse(acc.argsText);
+        } catch {
+          toolResults.push({
+            role: "tool",
+            tool_call_id: acc.id,
+            content: "tool args invalid, please retry",
+          });
+          continue;
+        }
+        realCalls.push({ id: acc.id, name: acc.name, args: parsed });
+      }
+
+      workingMessages = [...workingMessages, assistantMsg, ...toolResults];
+
+      // Yield each real tool call and await its result, appending the result
+      // to workingMessages as it arrives.
+      for (const call of realCalls) {
+        const resultPromise = new Promise((resolve) => {
+          this._pendingToolResolvers.set(call.id, resolve);
+        });
+        yield { type: "tool_call_request", name: call.name, args: call.args, callId: call.id };
+        const result = await resultPromise;
+        workingMessages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: typeof result === "string" ? result : JSON.stringify(result),
+        });
+      }
+    }
+
     yield {
       type: "done",
       fullText: this._fullText,
@@ -109,7 +167,7 @@ export class LLMSession {
     };
   }
 
-  async _streamRound(messages) {
+  async _streamRound(messages, forceNoTools = false) {
     this._roundCount += 1;
     this._fullText = "";
     const body = {
@@ -122,14 +180,12 @@ export class LLMSession {
     };
     if (this.toolSchema && this.toolSchema.length > 0) {
       body.tools = this.toolSchema;
-      body.tool_choice = "auto";
+      body.tool_choice = forceNoTools ? "none" : "auto";
     }
-
     const ac = new AbortController();
     if (this.abortSignal) {
       this.abortSignal.addEventListener("abort", () => ac.abort(), { once: true });
     }
-
     const res = await _fetch(OPENAI_URL, {
       method: "POST",
       headers: {
@@ -139,10 +195,12 @@ export class LLMSession {
       body: JSON.stringify(body),
       signal: ac.signal,
     });
-
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      const err = new LLMSessionError(`OpenAI HTTP ${res.status}: ${text.slice(0, 200)}`, this._classifyHttpError(res.status));
+      const err = new LLMSessionError(
+        `OpenAI HTTP ${res.status}: ${text.slice(0, 200)}`,
+        this._classifyHttpError(res.status),
+      );
       err.status = res.status;
       throw err;
     }
@@ -203,6 +261,8 @@ export class LLMSession {
           if (payload === "[DONE]") {
             const flushed = tryFlushSentence(true);
             if (flushed) yield { type: "sentence", text: flushed };
+            this._lastToolAcc = toolAcc;
+            this._lastFinishReason = finishReason;
             return; // generator done
           }
           let json;

@@ -218,3 +218,50 @@ describe("TTSSession — message dispatch", () => {
     }).not.toThrow();
   });
 });
+
+describe("TTSSession — stop()", () => {
+  let s;
+  beforeEach(async () => {
+    lastMockWs = null;
+    s = new TTSSession({ apiKey: "k", voiceId: "v", logger: makeLogger() });
+    const p = s.start();
+    lastMockWs._open();
+    await p;
+  });
+
+  it("emits 'stopped' when called", () => {
+    const stoppedSpy = vi.fn();
+    s.on("stopped", stoppedSpy);
+    s.stop();
+    expect(stoppedSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the WS", () => {
+    s.stop();
+    expect(lastMockWs.readyState).toBe(3); // CLOSED
+  });
+
+  it("after stop, no more 'audio' events fire", () => {
+    const audioSpy = vi.fn();
+    s.on("audio", audioSpy);
+    s.stop();
+    lastMockWs._msg({ audio: Buffer.from([1, 2]).toString("base64") });
+    expect(audioSpy).not.toHaveBeenCalled();
+  });
+
+  it("after stop, no 'done' fires from a delayed close", () => {
+    const doneSpy = vi.fn();
+    s.on("done", doneSpy);
+    s.stop();
+    lastMockWs.emit("close", 1000, Buffer.from(""));
+    expect(doneSpy).not.toHaveBeenCalled();
+  });
+
+  it("stop is idempotent", () => {
+    const stoppedSpy = vi.fn();
+    s.on("stopped", stoppedSpy);
+    s.stop();
+    s.stop();
+    expect(stoppedSpy).toHaveBeenCalledTimes(1);
+  });
+});

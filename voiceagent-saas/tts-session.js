@@ -176,7 +176,23 @@ export class TTSSession extends EventEmitter {
     }
   }
 
-  stop() { /* filled in Task 5 */ }
+  stop() {
+    if (this._stopped || this._closed) return;
+    this._stopped = true;
+    this._closed = true;
+    if (this._firstByteTimer) {
+      clearTimeout(this._firstByteTimer);
+      this._firstByteTimer = null;
+    }
+    if (this.ws) {
+      try {
+        if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === 0) {
+          this.ws.close(1000, "barge");
+        }
+      } catch {}
+    }
+    this.emit("stopped");
+  }
 
   _handleMessage(data) {
     if (this._stopped) return;

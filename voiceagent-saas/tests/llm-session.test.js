@@ -108,3 +108,108 @@ describe("LLMSession — sentence boundary detection (via run)", () => {
     expect(done.totalTokensOut).toBe(8);
   });
 });
+
+describe("LLMSession — tool calls", () => {
+  beforeEach(() => {
+    __setFetchForTests(null);
+  });
+
+  it("yields a tool_call_request when the model emits a tool_calls delta", async () => {
+    let callCount = 0;
+    __setFetchForTests(async () => {
+      callCount++;
+      if (callCount === 1) return fetchResponseFromSse(fixtures.TOOL_CALL_SPLIT_ARGS);
+      // Second call (after tool result) returns a normal sentence
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger(), toolSchema: [{ type: "function", function: { name: "score_lead", description: "x", parameters: { type: "object", properties: {} } } }] });
+    const yielded = [];
+    const gen = s.run([{ role: "user", content: "hi" }]);
+    for await (const ev of gen) {
+      yielded.push(ev);
+      if (ev.type === "tool_call_request") {
+        // Resolve the tool result so the loop can proceed.
+        s.provideToolResult(ev.callId, JSON.stringify({ ok: true }));
+      }
+    }
+    const tc = yielded.find((e) => e.type === "tool_call_request");
+    expect(tc).toBeTruthy();
+    expect(tc.name).toBe("score_lead");
+    expect(tc.args).toEqual({ score: 8, reason: "מתעניין בבירור" });
+    expect(tc.callId).toBe("call_abc");
+  });
+
+  it("yields tool_call_request for each parallel tool call in one round", async () => {
+    let callCount = 0;
+    __setFetchForTests(async () => {
+      callCount++;
+      if (callCount === 1) return fetchResponseFromSse(fixtures.PARALLEL_TOOL_CALLS);
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger(), toolSchema: [
+      { type: "function", function: { name: "score_lead", description: "x", parameters: { type: "object", properties: {} } } },
+      { type: "function", function: { name: "send_whatsapp", description: "x", parameters: { type: "object", properties: {} } } },
+    ] });
+    const calls = [];
+    for await (const ev of s.run([{ role: "user", content: "hi" }])) {
+      if (ev.type === "tool_call_request") {
+        calls.push(ev);
+        s.provideToolResult(ev.callId, JSON.stringify({ ok: true }));
+      }
+    }
+    expect(calls.length).toBe(2);
+    expect(calls.map((c) => c.name).sort()).toEqual(["score_lead", "send_whatsapp"]);
+  });
+
+  it("emits synthetic tool_result for malformed tool args", async () => {
+    let secondRoundMessages = null;
+    let callCount = 0;
+    __setFetchForTests(async (url, opts) => {
+      callCount++;
+      if (callCount === 1) return fetchResponseFromSse(fixtures.TOOL_CALL_MALFORMED_ARGS);
+      // Inspect the messages on the second call
+      secondRoundMessages = JSON.parse(opts.body).messages;
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger(), toolSchema: [
+      { type: "function", function: { name: "score_lead", description: "x", parameters: { type: "object", properties: {} } } },
+    ] });
+    const gen = s.run([{ role: "user", content: "hi" }]);
+    let toolReqCount = 0;
+    for await (const ev of gen) {
+      if (ev.type === "tool_call_request") {
+        toolReqCount++;
+        s.provideToolResult(ev.callId, JSON.stringify({ ok: true }));
+      }
+    }
+    // No real tool_call_request should be emitted (malformed). The second
+    // round should have a synthetic tool result indicating retry.
+    expect(toolReqCount).toBe(0);
+    const toolMsg = secondRoundMessages?.find((m) => m.role === "tool");
+    expect(toolMsg).toBeTruthy();
+    expect(toolMsg.content).toMatch(/invalid|retry/i);
+  });
+
+  it("after MAX_TOOL_ROUNDS, forces tool_choice='none' on the next request", async () => {
+    let callCount = 0;
+    let lastBody = null;
+    __setFetchForTests(async (url, opts) => {
+      callCount++;
+      lastBody = JSON.parse(opts.body);
+      if (callCount <= 3) return fetchResponseFromSse(fixtures.TOOL_CALL_SPLIT_ARGS);
+      return fetchResponseFromSse(fixtures.SIMPLE_HEBREW);
+    });
+    const s = new LLMSession({ apiKey: "k", logger: makeLogger(), toolSchema: [
+      { type: "function", function: { name: "score_lead", description: "x", parameters: { type: "object", properties: {} } } },
+    ] });
+    for await (const ev of s.run([{ role: "user", content: "hi" }])) {
+      if (ev.type === "tool_call_request") {
+        s.provideToolResult(ev.callId, JSON.stringify({ ok: true }));
+      }
+    }
+    // 4th request should have tool_choice='none'
+    expect(callCount).toBeGreaterThanOrEqual(4);
+    expect(lastBody.tool_choice).toBe("none");
+  });
+});
