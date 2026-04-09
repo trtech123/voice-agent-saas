@@ -454,7 +454,74 @@ export class UnbundledPipeline extends EventEmitter {
   }
 
   async _handleToolCall(req, llm) {
-    // Filled in by Task 5.
+    this.metrics.toolCallCount += 1;
+    const startedAt = Date.now();
+    const prevState = this._state;
+    this._setState(STATE.TOOL_RUNNING);
+
+    // Track failure count for the per-tool-name guard
+    const failKey = req.name;
+    const failCount = this._toolFailureCounts.get(failKey) || 0;
+
+    // Schedule the filler timer
+    let fillerScheduled = setTimeout(() => {
+      if (this._state !== STATE.TOOL_RUNNING) return;
+      this._setState(STATE.FILLER_AUDIO);
+      if (_fillerPcm.length > 0) {
+        this.emit("agent_audio", _fillerPcm);
+      }
+    }, FILLER_DELAY_MS);
+
+    // Execute the tool with a barge race
+    let result;
+    let toolError = null;
+    const toolPromise = (async () => {
+      try {
+        const out = await Promise.race([
+          executeToolCall(req.name, req.args, this.toolContext),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("tool timeout")), TOOL_EXEC_TIMEOUT_MS)),
+        ]);
+        return out;
+      } catch (err) {
+        toolError = err;
+        return { error: String(err.message || err) };
+      }
+    })();
+    this._currentToolPromise = toolPromise;
+
+    result = await toolPromise;
+    this._currentToolPromise = null;
+    clearTimeout(fillerScheduled);
+
+    const elapsed = Date.now() - startedAt;
+    this.metrics.toolCallMaxMs = Math.max(this.metrics.toolCallMaxMs, elapsed);
+
+    if (toolError) {
+      this._toolFailureCounts.set(failKey, failCount + 1);
+    }
+
+    // Emit tool_call event for live-turn-writer to persist
+    this.emit("tool_call", {
+      name: req.name,
+      args: req.args,
+      callId: req.callId,
+      result,
+      elapsedMs: elapsed,
+    });
+
+    // Special-case end_call — wait for in-flight TTS to drain (capped 10s) then close
+    if (req.name === "end_call") {
+      llm.provideToolResult(req.callId, JSON.stringify(result));
+      // Let the LLM finish its post-tool message, then close.
+      setTimeout(() => this.close("tool_end_call"), 10_000);
+      return;
+    }
+
+    // Resume the LLM with the tool result
+    llm.provideToolResult(req.callId, JSON.stringify(result));
+    if (prevState === STATE.SPEAKING || prevState === STATE.PROCESSING) {
+      this._setState(prevState);
+    }
   }
 
   async _playErrorAndClose(reason) {
