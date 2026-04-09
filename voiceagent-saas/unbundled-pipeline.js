@@ -179,10 +179,66 @@ export class UnbundledPipeline extends EventEmitter {
 
   /** Open Deepgram WS, run boot synthesis (once per process), prepare. */
   async connect() {
-    // Filled in by Task 2.
+    if (this._state !== STATE.IDLE) {
+      this.log.warn({ state: this._state }, "connect() called in non-IDLE state");
+      return;
+    }
+    // Boot synthesis (once per process; cheap subsequent calls)
+    await bootSynthesizeOnce(this.apiKeys.elevenlabs, this.log);
+
+    // Install max-duration kill switch
+    this._maxDurationTimer = setTimeout(() => {
+      this.log.warn("unbundled max duration kill switch fired");
+      this.emit("error", new UnbundledPipelineError("max duration", "max_duration_exceeded"));
+      this.close("max_duration_exceeded");
+    }, MAX_DURATION_MS);
+
+    // Open Deepgram session
+    this._dg = new DeepgramSession({
+      apiKey: this.apiKeys.deepgram,
+      logger: this.log.child ? this.log.child({ component: "dg" }) : this.log,
+    });
+    this._wireDeepgramHandlers();
+    try {
+      await this._dg.connect();
+    } catch (err) {
+      this.log.error({ err: err.message }, "deepgram connect failed");
+      this.emit("error", new UnbundledPipelineError("stt init failed", "stt_init_failed"));
+      throw err;
+    }
+
     this._setState(STATE.CONNECTED);
     this.emit("ws_open");
     this.emit("conversation_id", this.conversationId);
+  }
+
+  _wireDeepgramHandlers() {
+    this._dg.on("partial", (e) => this._onDeepgramPartial(e));
+    this._dg.on("final", (e) => this._onDeepgramFinal(e));
+    this._dg.on("utterance_end", (e) => this._handleUtteranceEndFailover(e));
+    this._dg.on("ws_reopen", () => {
+      this.metrics.dgReconnectCount += 1;
+      this.log.info("deepgram reconnected mid-call");
+    });
+    this._dg.on("error", (err) => {
+      this.log.error({ err: err.message, code: err.code }, "deepgram error");
+      this.emit("error", new UnbundledPipelineError(err.message, "stt_dropped"));
+      this.close("stt_dropped");
+    });
+  }
+
+  _onDeepgramPartial(evt) {
+    // Stash latest partial for the next turn-commit + evaluate barge gate.
+    this._latestPartialText = evt.text;
+    this._latestPartialAt = evt.ts;
+    if (this._state === STATE.SPEAKING || this._state === STATE.PROCESSING) {
+      this._evaluateBargeGate(evt);
+    }
+  }
+
+  _onDeepgramFinal(evt) {
+    this._latestPartialText = evt.text;
+    this._latestPartialAt = evt.ts;
   }
 
   /** Begin the conversation: synthesize the greeting and inject as turn 0. */
