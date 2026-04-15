@@ -23,7 +23,7 @@ export interface ToolExecutionContext {
   whatsappFollowupLink: string | null;
   dal: {
     contacts: Pick<ContactDAL, "markDnc">;
-    calls: Pick<CallDAL, "update">;
+    calls: Pick<CallDAL, "update" | "getById">;
     campaignContacts: Pick<CampaignContactDAL, "updateStatus">;
     auditLog: Pick<AuditLogDAL, "log">;
   };
@@ -194,11 +194,15 @@ async function handleScoreLead(
   const status = String(args.status);
   const answers = (args.answers as Record<string, string>) ?? {};
 
+  // Fetch existing to merge
+  const currentCall = await ctx.dal.calls.getById(ctx.callId);
+  const existingAnswers = (currentCall?.qualification_answers as Record<string, string>) ?? {};
+
   // Persist to calls table
   await ctx.dal.calls.update(ctx.callId, {
     lead_score: score,
     lead_status: status as "hot" | "warm" | "cold" | "not_interested" | "callback",
-    qualification_answers: answers,
+    qualification_answers: { ...existingAnswers, ...answers },
   });
 
   return { success: true, score, status };
@@ -241,10 +245,14 @@ async function handleRequestCallback(
 ): Promise<ToolResult> {
   const preferredTime = String(args.preferred_time ?? "");
 
+  // Fetch existing to merge
+  const currentCall = await ctx.dal.calls.getById(ctx.callId);
+  const existingAnswers = (currentCall?.qualification_answers as Record<string, string>) ?? {};
+
   // Update call record with callback status
   await ctx.dal.calls.update(ctx.callId, {
     lead_status: "callback",
-    qualification_answers: { callback_preferred_time: preferredTime },
+    qualification_answers: { ...existingAnswers, callback_preferred_time: preferredTime },
   });
 
   // Log audit event

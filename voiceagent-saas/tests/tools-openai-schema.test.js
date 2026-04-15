@@ -62,4 +62,13 @@ describe("buildOpenAIToolSchema", () => {
     const tool = schema.find((t) => t.function.name === "end_call");
     expect(tool.function.parameters.required ?? []).toEqual([]);
   });
+
+  it("request_callback requires preferred_time and callback_timestamp", () => {
+    const schema = buildOpenAIToolSchema();
+    const tool = schema.find((t) => t.function.name === "request_callback");
+    expect(tool.function.parameters.properties).toHaveProperty("preferred_time");
+    expect(tool.function.parameters.properties).toHaveProperty("callback_timestamp");
+    expect(tool.function.parameters.required).toContain("preferred_time");
+    expect(tool.function.parameters.required).toContain("callback_timestamp");
+  });
 });

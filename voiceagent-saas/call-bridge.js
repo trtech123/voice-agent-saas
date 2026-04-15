@@ -853,18 +853,29 @@ export class CallBridge {
 
   async _persistFinalState() {
     const endedIso = this.endedAt.toISOString();
+    const durationSeconds = Math.max(
+      0,
+      Math.floor((this.endedAt - this.callStartedAt) / 1000),
+    );
 
-    // DUAL WRITE both failure_reason columns (legacy text + new enum) per
-    // T12.4 / spec §3 — old code paths still read failure_reason.
-    const update = { ended_at: endedIso };
+    const update = {
+      ended_at: endedIso,
+      duration_seconds: durationSeconds,
+    };
     if (this.failureReason) {
+      update.status = "failed";
       update.failure_reason = this.failureReason;
       update.failure_reason_t = this.failureReason;
+    } else {
+      update.status = "completed";
     }
     try {
-      await this.supabase.from("calls").update(update).eq("id", this.callId);
+      const { error } = await this.supabase.from("calls").update(update).eq("id", this.callId);
+      if (error) {
+        this.log.error({ error, callId: this.callId }, "calls update on finalize failed");
+      }
     } catch (err) {
-      this.log.error({ err }, "calls update on finalize failed");
+      this.log.error({ err }, "calls update on finalize threw");
     }
 
     // call_metrics: primary-key upsert. Bridge path is last-writer-wins

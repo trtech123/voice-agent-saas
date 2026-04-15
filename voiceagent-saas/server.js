@@ -18,13 +18,28 @@ import Fastify from "fastify";
 import fastifyWs from "@fastify/websocket";
 import { ariRequest, ensureAriEventSocket, getAriStatus, subscribeToAriEvents } from "./ari-client.js";
 import { registerGatewayMediaSocket } from "./media-bridge.js";
-import { createCallWorker, createMonthlyResetScheduler } from "./call-processor.js";
 import {
+  createCallWorker,
+  createMonthlyResetScheduler,
+  resolveVoicePipeline,
+} from "./call-processor.js";
+import {
+  CallBridge,
   getActiveBridge,
   getActiveBridgeCount,
   cleanupAllBridges,
+  preRegisterBridge,
 } from "./call-bridge.js";
 import { createClient } from "@supabase/supabase-js";
+import { ComplianceGate } from "./compliance.js";
+import {
+  findOrCreateInboundContact,
+  findPhoneNumberRoute,
+  getSystemDefaultRoute,
+  normalizeDigits,
+  resolveInboundCampaignId,
+} from "./inbound-routing.js";
+import { startInboundBridgeFinalizer } from "./inbound-finalizer.js";
 import { startLiveTurnWriter, stopLiveTurnWriter } from "./live-turn-writer.js";
 import { startAgentSyncWorker, stopAgentSyncWorker } from "./agent-sync-processor.js";
 import { startJanitor, stopJanitor } from "./janitor.js";
@@ -75,6 +90,7 @@ await fastify.register(fastifyWs);
 const callsBySipId = new Map();
 const callIndexByCallId = new Map();
 const channelToCall = new Map();
+const inboundChannelsInFlight = new Set();
 
 // ─── Utility Functions (from gateway server.js) ───────────────────
 
@@ -88,7 +104,9 @@ function verifyApiKey(request, reply) {
     return false;
   }
   const auth = request.headers.authorization || "";
-  if (auth !== `Bearer ${SIP_GATEWAY_API_KEY}`) {
+  const expectedAuth = `Bearer ${SIP_GATEWAY_API_KEY}`;
+  
+  if (auth.length !== expectedAuth.length || !crypto.timingSafeEqual(Buffer.from(auth), Buffer.from(expectedAuth))) {
     reply.code(401).send({ error: "Unauthorized" });
     return false;
   }
@@ -155,8 +173,64 @@ function buildVoicenterDialTarget(phoneNumber) {
   return `PJSIP/${VOICENTER_PJSIP_ENDPOINT}/${sipUri}`;
 }
 
-function normalizeDigits(value) {
-  return String(value || "").replace(/[^\d]/g, "");
+function createInboundToolContext({ callId, tenantId, campaignId, contact, log }) {
+  return {
+    tenantId,
+    campaignId,
+    contactId: contact.id,
+    callId,
+    contactPhone: contact.phone,
+    contactName: contact.name || "",
+    whatsappFollowupTemplate: null,
+    whatsappFollowupLink: null,
+    dal: {
+      contacts: {
+        async markDnc(contactId, source) {
+          await supabaseAdmin
+            .from("contacts")
+            .update({ dnc_status: true, dnc_source: source, dnc_at: new Date().toISOString() })
+            .eq("id", contactId)
+            .eq("tenant_id", tenantId);
+        },
+      },
+      calls: {
+        async update(id, data) {
+          await supabaseAdmin
+            .from("calls")
+            .update({ ...data, updated_at: new Date().toISOString() })
+            .eq("id", id);
+        },
+        async getById(id) {
+          const { data } = await supabaseAdmin
+            .from("calls")
+            .select("*")
+            .eq("id", id)
+            .single();
+          return data || null;
+        },
+      },
+      auditLog: {
+        async log(action, resourceType, resourceId, metadata = {}) {
+          await supabaseAdmin.from("audit_logs").insert({
+            tenant_id: tenantId,
+            action,
+            resource_type: resourceType,
+            resource_id: resourceId,
+            metadata,
+            created_at: new Date().toISOString(),
+          });
+        },
+      },
+      campaignContacts: {
+        async updateStatus() {},
+      },
+    },
+    async sendWhatsApp() {
+      log.info({ callId }, "Inbound sendWhatsApp tool invoked without configured channel");
+      return { success: false, messageId: null };
+    },
+    log,
+  };
 }
 
 // ─── ARI Event Helpers (from gateway server.js) ───────────────────
@@ -412,10 +486,11 @@ subscribeToAriEvents(async (event) => {
     if (!call && isVoicenterCustomerChannel(event.channel)) {
       call = findCallForCustomerChannel(event.channel);
       if (!call) {
-        fastify.log.warn(
+        fastify.log.info(
           { channel: getChannelDebugFields(event.channel) },
-          "Ignoring unrelated Voicenter customer channel",
+          "No outbound call match for Voicenter channel, attempting inbound routing",
         );
+        await handleInboundCall(event.channel);
         return;
       }
     }
@@ -562,7 +637,7 @@ async function initiateCall(phoneNumber, callId) {
         transport: "websocket",
         encapsulation: "none",
         format: ASTERISK_MEDIA_FORMAT,
-        transport_data: `f(json)v(callId=${callId},sipCallId=${sipCallId})`,
+        transport_data: `f(json)v(callId=${callId},sipCallId=${sipCallId},token=${SIP_GATEWAY_API_KEY})`,
       },
     });
 
@@ -610,6 +685,208 @@ async function initiateCall(phoneNumber, callId) {
 
 function getCallState(sipCallId) {
   return callsBySipId.get(sipCallId) || null;
+}
+
+async function handleInboundCall(channel) {
+  const channelId = channel?.id;
+  if (!channelId) return;
+  if (inboundChannelsInFlight.has(channelId)) return;
+  inboundChannelsInFlight.add(channelId);
+
+  const callerNumber = channel?.caller?.number || "";
+  const sipCallId = crypto.randomUUID();
+  const mediaChannelId = `media-${sipCallId}`;
+  const bridgeId = `bridge-${sipCallId}`;
+
+  try {
+    const didRoute = await findPhoneNumberRoute(supabaseAdmin, channel);
+    let tenantId = didRoute?.tenant_id || null;
+    let defaultCampaignId = didRoute?.default_campaign_id || null;
+
+    if (!tenantId) {
+      const fallback = await getSystemDefaultRoute(supabaseAdmin, fastify.log);
+      tenantId = fallback?.tenantId || null;
+      defaultCampaignId = fallback?.campaignId || null;
+    }
+    if (!tenantId) {
+      fastify.log.warn(
+        { callerNumber, channel: getChannelDebugFields(channel) },
+        "Inbound call rejected: no DID or system default route configured",
+      );
+      try { await ariRequest("DELETE", `/channels/${channelId}`); } catch {}
+      return;
+    }
+
+    const contact = await findOrCreateInboundContact(supabaseAdmin, tenantId, callerNumber);
+    const campaignId = await resolveInboundCampaignId(
+      supabaseAdmin,
+      tenantId,
+      contact.id,
+      defaultCampaignId,
+      fastify.log,
+    );
+    if (!campaignId) {
+      fastify.log.warn({ tenantId, callerNumber }, "Inbound call rejected: no campaign route available");
+      try { await ariRequest("DELETE", `/channels/${channelId}`); } catch {}
+      return;
+    }
+
+    const [{ data: tenant }, { data: campaign }] = await Promise.all([
+      supabaseAdmin.from("tenants").select("*").eq("id", tenantId).single(),
+      supabaseAdmin
+        .from("campaigns")
+        .select("*")
+        .eq("id", campaignId)
+        .eq("tenant_id", tenantId)
+        .eq("status", "active")
+        .single(),
+    ]);
+    if (!tenant || !campaign || !campaign.elevenlabs_agent_id || campaign.sync_version == null) {
+      fastify.log.warn(
+        { tenantId, campaignId, hasAgentId: Boolean(campaign?.elevenlabs_agent_id) },
+        "Inbound call rejected: campaign not ready",
+      );
+      try { await ariRequest("DELETE", `/channels/${channelId}`); } catch {}
+      return;
+    }
+
+    // Answer first; if caller already dropped, ARI may return 404/409.
+    try {
+      await ariRequest("POST", `/channels/${channelId}/answer`);
+    } catch (error) {
+      fastify.log.warn({ error, channelId }, "Inbound answer skipped (channel no longer available)");
+      return;
+    }
+
+    const { data: callRow, error: callInsertError } = await supabaseAdmin
+      .from("calls")
+      .insert({
+        tenant_id: tenantId,
+        campaign_id: campaignId,
+        contact_id: contact.id,
+        campaign_contact_id: null,
+        status: "connected",
+        direction: "inbound",
+        started_at: new Date().toISOString(),
+        agent_id_used: campaign.elevenlabs_agent_id,
+        sync_version_used: campaign.sync_version,
+      })
+      .select("id")
+      .single();
+    if (callInsertError || !callRow?.id) throw callInsertError || new Error("Failed to create inbound call row");
+
+    const callId = callRow.id;
+    const enhancedScript = new ComplianceGate(null, null, null, null).injectRecordingConsent(campaign.script || "");
+    const enhancedSystemPrompt = new ComplianceGate(null, null, null, null).injectRecordingConsent(
+      campaign.system_prompt || campaign.script || "",
+    );
+    const voicePipeline = resolveVoicePipeline(campaign, tenant);
+    const bridge = new CallBridge({
+      voicePipeline,
+      callId,
+      tenantId,
+      campaignId,
+      contactId: contact.id,
+      campaignContactId: null,
+      agentIdUsed: campaign.elevenlabs_agent_id,
+      syncVersionUsed: campaign.sync_version,
+      supabase: supabaseAdmin,
+      contactPhone: contact.phone,
+      contactName: contact.name,
+      campaign: {
+        id: campaign.id,
+        name: campaign.name,
+        script: enhancedScript,
+        system_prompt: enhancedSystemPrompt,
+        questions: campaign.questions,
+        voice_id: campaign.voice_id,
+        tts_model: campaign.tts_model || null,
+        first_message: campaign.first_message || null,
+        whatsapp_followup_template: campaign.whatsapp_followup_template,
+        whatsapp_followup_link: campaign.whatsapp_followup_link,
+      },
+      tenant: {
+        id: tenant.id,
+        name: tenant.name,
+        business_type: tenant.business_type,
+      },
+      contact: {
+        id: contact.id,
+        name: contact.name,
+        phone: contact.phone,
+        custom_fields: contact.custom_fields || {},
+      },
+      toolContext: createInboundToolContext({
+        callId,
+        tenantId,
+        campaignId,
+        contact,
+        log: fastify.log,
+      }),
+      log: fastify.log,
+    });
+    preRegisterBridge(callId, bridge);
+
+    const inboundCall = {
+      callId,
+      sipCallId,
+      bridgeId,
+      customerChannelId: channelId,
+      customerChannelName: channel?.name || null,
+      pendingCustomerChannelId: null,
+      pendingCustomerChannelName: null,
+      mediaChannelId,
+      phoneNumber: normalizePhoneNumber(callerNumber),
+      eventWebhookUrl: null,
+      mediaStreamUrl: null,
+      metadata: { direction: "inbound", dialedDid: didRoute?.phone_number || null },
+      tenantId,
+      customerBridgeAdded: false,
+      mediaBridgeAdded: false,
+      status: "connected",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    callsBySipId.set(sipCallId, inboundCall);
+    callIndexByCallId.set(callId, sipCallId);
+    attachChannel(inboundCall, channelId, "customer");
+    attachChannel(inboundCall, mediaChannelId, "media");
+
+    await ariRequest("POST", `/bridges/${bridgeId}`, {
+      query: { type: "mixing", name: `voiceagent-saas-inbound-${sipCallId}` },
+    });
+    await ariRequest("POST", "/channels/externalMedia", {
+      query: {
+        app: ASTERISK_ARI_APP,
+        channelId: mediaChannelId,
+        external_host: ASTERISK_MEDIA_CONNECTION_NAME,
+        transport: "websocket",
+        encapsulation: "none",
+        format: ASTERISK_MEDIA_FORMAT,
+        transport_data: `f(json)v(callId=${callId},sipCallId=${sipCallId},token=${SIP_GATEWAY_API_KEY})`,
+      },
+    });
+    await addChannelToBridge(inboundCall, channelId);
+
+    startInboundBridgeFinalizer({
+      bridge,
+      call: inboundCall,
+      db: supabaseAdmin,
+      cleanupAsteriskResources,
+      log: fastify.log,
+    });
+    bridge.handleCustomerAnswered();
+
+    fastify.log.info(
+      { sipCallId, callId, tenantId, campaignId, callerNumber, did: didRoute?.phone_number || null },
+      "Inbound call routed",
+    );
+  } catch (error) {
+    fastify.log.error({ error, channel: getChannelDebugFields(channel) }, "Failed handling inbound call");
+    try { await ariRequest("DELETE", `/channels/${channelId}`); } catch {}
+  } finally {
+    inboundChannelsInFlight.delete(channelId);
+  }
 }
 
 // ─── HTTP Auth Hook ───────────────────────────────────────────────
@@ -755,7 +1032,10 @@ const eventLoopMonitorInterval = setInterval(() => {
 
 let worker = null;
 let monthlyResetScheduler = null;
-let supabaseAdmin = null;
+let supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+);
 let auxWorkersStarted = false;
 
 // ─── Boot Ordering (LOAD-BEARING) ──────────────────────────────────
@@ -767,10 +1047,6 @@ let auxWorkersStarted = false;
 // Note: audio archival is handled synchronously in the dashboard webhook
 // handler (post_call_audio event); no worker or queue runs on the droplet.
 if (REDIS_URL) {
-  supabaseAdmin = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-  );
   const bullConnection = { url: REDIS_URL };
 
   // 1. live-turn-writer FIRST

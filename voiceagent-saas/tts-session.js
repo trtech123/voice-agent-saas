@@ -38,9 +38,10 @@ export class TTSSession extends EventEmitter {
    * @param {object} opts.logger
    * @param {string} [opts.modelId="eleven_turbo_v2_5"]
    * @param {object} [opts.voiceSettings]
+   * @param {string} [opts.languageCode="he"] - ISO 639-1; avoids wrong-language prosody on multilingual models
    * @param {number} [opts.optimizeStreamingLatency=3]
    */
-  constructor({ apiKey, voiceId, logger, modelId, voiceSettings, optimizeStreamingLatency } = {}) {
+  constructor({ apiKey, voiceId, logger, modelId, voiceSettings, optimizeStreamingLatency, languageCode } = {}) {
     super();
     if (!apiKey) throw new Error("TTSSession: apiKey required");
     if (!voiceId) throw new Error("TTSSession: voiceId required");
@@ -51,6 +52,8 @@ export class TTSSession extends EventEmitter {
     this.modelId = modelId || DEFAULT_MODEL;
     this.voiceSettings = voiceSettings || { stability: 0.5, similarity_boost: 0.8, speed: 1.0 };
     this.optimizeStreamingLatency = optimizeStreamingLatency ?? 3;
+    this.languageCode =
+      languageCode ?? (process.env.ELEVENLABS_TTS_LANGUAGE_CODE || "he");
 
     this.ws = null;
     this._wsOpen = false;
@@ -104,6 +107,7 @@ export class TTSSession extends EventEmitter {
           text: " ",
           voice_settings: this.voiceSettings,
           xi_api_key: this.apiKey, // footgun: required in body too per EL protocol
+          ...(this.languageCode ? { language_code: this.languageCode } : {}),
         };
         try {
           ws.send(JSON.stringify(bos));

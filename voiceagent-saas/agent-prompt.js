@@ -24,6 +24,22 @@
  * 8. Contact context
  */
 export function buildSystemPrompt(campaign, tenant, contact) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const timeIsrael = new Intl.DateTimeFormat("he-IL", {
+    timeZone: "Asia/Jerusalem",
+    hour: "2-digit",
+    minute: "2-digit",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(now);
+  const dayOfWeek = new Intl.DateTimeFormat("he-IL", {
+    timeZone: "Asia/Jerusalem",
+    weekday: "long",
+  }).format(now);
+  const scheduleInfo = formatScheduleForPrompt(campaign);
+
   // Replace [שם העסק] placeholder in campaign script
   const script = campaign.script.replace(/\[שם העסק\]/g, tenant.name);
 
@@ -63,14 +79,20 @@ ${script}
 בתחילת השיחה, לאחר ההצגה העצמית, יש לומר: "שים לב, השיחה מוקלטת לצורך שיפור השירות."
 
 ## שאלות הסמכה
-שאל/י את השאלות הבאות בזו אחר זו. אל תדלג/י על שאלות. המתן/י לתשובה לפני שממשיכים לשאלה הבאה.
+שאל/י את השאלות הבאות בזו אחר זו. המתן/י לתשובה לפני שממשיכים לשאלה הבאה.
+אם הלקוח מביע התנגדות, מבקש לסיים, או מבקש לחזור אליו במועד אחר - הפסק מיד את השאלות ועבור לשימוש בכלים המתאימים משבלי להתעקש על קבלת תשובות!
 ${questionsBlock}
+
+## תזמון שיחות חוזרות
+השעה, היום והתאריך כעת הם: ${timeIsrael} (יום ${dayOfWeek}) (UTC: ${nowIso}).
+שעות ההתקשרות המותרות לקמפיין: ${scheduleInfo}.
+אם הלקוח מבקש שיחה חוזרת, חשב/י callback_timestamp מדויק בפורמט ISO 8601 (UTC, מסתיים ב-Z) בתוך שעות הפעילות המותרות. אם הזמן המבוקש לא חוקי, הצע/י זמן חוקי קרוב.
 
 ## שימוש בכלים
 לאחר שאספת תשובות לשאלות ההסמכה, יש להשתמש בכלים הבאים:
 - **score_lead** — דרג/י את הלקוח לפי התשובות (ציון 1-5, סטטוס: hot/warm/cold/not_interested/callback). חובה לקרוא לכלי הזה לפני סיום השיחה.
 - **send_whatsapp** — אם הלקוח מעוניין, שלח/י הודעת וואטסאפ עם פרטים נוספים. אמור/י ללקוח שתשלח/י פרטים לוואטסאפ.
-- **request_callback** — אם הלקוח מבקש שיחזרו אליו בזמן אחר.
+- **request_callback** — אם הלקוח מבקש שיחזרו אליו בזמן אחר, חובה להפעיל מיד כלי זה ולהעביר את הזמן המדויק שביקש גם ב-preferred_time וגם ב-callback_timestamp בפורמט ISO 8601 UTC. אין להמשיך בשאלות ההסמכה!
 - **mark_opt_out** — אם הלקוח אומר שהוא לא מעוניין ומבקש שלא יתקשרו אליו שוב. אמור/י: "בסדר גמור, אני מסיר/ה אותך מהרשימה."
 - **end_call** — סיים/י את השיחה. חובה לקרוא ל-score_lead לפני end_call.
 
@@ -156,4 +178,16 @@ export function buildFromCampaign({ systemPrompt, firstMessage, dynamicVariables
     systemPrompt: interpolate(systemPrompt),
     firstMessage: interpolate(firstMessage),
   };
+}
+
+function formatScheduleForPrompt(campaign) {
+  const days = Array.isArray(campaign?.schedule_days) && campaign.schedule_days.length > 0
+    ? campaign.schedule_days.join(", ")
+    : "sun, mon, tue, wed, thu";
+  const windows = Array.isArray(campaign?.schedule_windows) && campaign.schedule_windows.length > 0
+    ? campaign.schedule_windows
+      .map((window) => `${window.start}-${window.end}`)
+      .join(", ")
+    : "10:00-13:00, 16:00-19:00";
+  return `ימים: ${days}; חלונות זמן: ${windows}`;
 }

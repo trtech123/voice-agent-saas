@@ -24,7 +24,7 @@
 import { Worker, Queue } from "bullmq";
 import { createClient } from "@supabase/supabase-js";
 import { CallBridge, preRegisterBridge } from "./call-bridge.js";
-import { ComplianceGate, DncEnforcer, isWithinScheduleWindows } from "./compliance.js";
+import { ComplianceGate, DncEnforcer, getNextScheduleWindow } from "./compliance.js";
 import { executeToolCall, buildToolDefinitions } from "./tools.js";
 import { WhatsAppClient } from "./whatsapp-client.js";
 
@@ -72,6 +72,20 @@ const TRANSPARENT_RETRY_REASONS = new Set(["agent_version_mismatch"]);
 // Backoff schedule (ms) by current retry_count (capped at last entry).
 const RETRY_BACKOFF_MS = [15 * 60 * 1000, 60 * 60 * 1000, 4 * 60 * 60 * 1000];
 const MAX_DAILY_RETRIES = 3;
+const CALL_LOCK_TTL_SEC = 15 * 60;
+const CALL_LOCK_KEY_PREFIX = "call-lock";
+const RELEASE_CALL_LOCK_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`;
+const EXTEND_CALL_LOCK_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`;
 
 /**
  * Compute today's date in Israel timezone (DST-correct), as ISO yyyy-mm-dd.
@@ -79,6 +93,43 @@ const MAX_DAILY_RETRIES = 3;
  */
 function israelTodayIso() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Jerusalem" });
+}
+
+export function buildCallLockKey(tenantId, campaignId, contactId) {
+  const env = process.env.NODE_ENV || "unknown";
+  return `${CALL_LOCK_KEY_PREFIX}:${env}:${tenantId}:${campaignId}:${contactId}`;
+}
+
+async function acquireCallLock(redis, key, token, ttlSec = CALL_LOCK_TTL_SEC) {
+  const result = await redis.set(key, token, "EX", ttlSec, "NX");
+  return result === "OK";
+}
+
+async function getCallLockOwnerToken(redis, key) {
+  return redis.get(key);
+}
+
+async function extendCallLockIfOwned(redis, key, token, ttlSec = CALL_LOCK_TTL_SEC) {
+  const result = await redis.eval(EXTEND_CALL_LOCK_SCRIPT, 1, key, token, String(ttlSec));
+  return Number(result) === 1;
+}
+
+export async function releaseCallLock(redis, key, token) {
+  const result = await redis.eval(RELEASE_CALL_LOCK_SCRIPT, 1, key, token);
+  return Number(result) === 1;
+}
+
+export async function acquireOrRecoverCallLock(redis, key, token, ttlSec = CALL_LOCK_TTL_SEC) {
+  const acquired = await acquireCallLock(redis, key, token, ttlSec);
+  if (acquired) return { acquired: true, ownerToken: token, recovered: false };
+
+  const ownerToken = await getCallLockOwnerToken(redis, key);
+  if (ownerToken === token) {
+    const recovered = await extendCallLockIfOwned(redis, key, token, ttlSec);
+    if (recovered) return { acquired: true, ownerToken: token, recovered: true };
+  }
+
+  return { acquired: false, ownerToken: ownerToken || null, recovered: false };
 }
 
 // ─── Supabase Client ───────────────────────────────────────────────
@@ -122,16 +173,7 @@ class TenantDAL {
     const { data, error } = await this.db.rpc("increment_calls_used", {
       p_tenant_id: this.tenantId,
     });
-    if (error) {
-      // Fallback: manual increment
-      const tenant = await this.get();
-      const newCount = (tenant.calls_used_this_month || 0) + 1;
-      await this.db
-        .from("tenants")
-        .update({ calls_used_this_month: newCount })
-        .eq("id", this.tenantId);
-      return newCount;
-    }
+    if (error) throw error;
     return data;
   }
 }
@@ -201,6 +243,7 @@ class CampaignContactDAL {
       .from("campaign_contacts")
       .select("*")
       .eq("id", id)
+      .eq("tenant_id", this.tenantId)
       .single();
     if (error) return null;
     return data;
@@ -210,7 +253,8 @@ class CampaignContactDAL {
     await this.db
       .from("campaign_contacts")
       .update({ status, ...extra, updated_at: new Date().toISOString() })
-      .eq("id", id);
+      .eq("id", id)
+      .eq("tenant_id", this.tenantId);
   }
 }
 
@@ -231,10 +275,12 @@ class CallDAL {
   }
 
   async update(id, data) {
-    await this.db
+    const { error } = await this.db
       .from("calls")
-      .update({ ...data, updated_at: new Date().toISOString() })
-      .eq("id", id);
+      .update(data)
+      .eq("id", id)
+      .eq("tenant_id", this.tenantId);
+    if (error) throw error;
   }
 
   async getById(id) {
@@ -242,6 +288,7 @@ class CallDAL {
       .from("calls")
       .select("*")
       .eq("id", id)
+      .eq("tenant_id", this.tenantId)
       .single();
     if (error) return null;
     return data;
@@ -347,6 +394,7 @@ async function processCallJob(job, config) {
   const callDal = new CallDAL(db, tenantId);
   const transcriptDal = new CallTranscriptDAL(db, tenantId);
   const auditLogDal = new AuditLogDAL(db, tenantId);
+  const redis = config.redis;
 
   // -- Step 1: Load entities --
   const [tenant, campaign, contact, campaignContact] = await Promise.all([
@@ -454,10 +502,71 @@ async function processCallJob(job, config) {
     // If DNC, update campaign_contact status
     if (precondition.checks?.dnc === "blocked") {
       await campaignContactDal.updateStatus(campaignContactId, "dnc");
+      return;
+    }
+
+    // If blocked only by schedule window, re-enqueue instead of dropping.
+    if (precondition.checks?.schedule === "blocked") {
+      await handleScheduleBlockedReschedule({
+        db,
+        log,
+        job,
+        campaign,
+        campaignContactId,
+        retryQueueName: CALL_QUEUE_NAME,
+      });
     }
 
     return;
   }
+
+  if (!redis) {
+    log.error("Missing Redis client in call processor config");
+    throw new Error("call_lock_redis_not_available");
+  }
+
+  const lockToken = String(job.id);
+  const lockKey = buildCallLockKey(tenantId, campaignId, contactId);
+  let lockAcquired = false;
+  try {
+    const lockResult = await acquireOrRecoverCallLock(redis, lockKey, lockToken, CALL_LOCK_TTL_SEC);
+    lockAcquired = lockResult.acquired;
+    if (!lockAcquired) {
+      log.info(
+        {
+          event: "call_lock_duplicate_skip",
+          tenantId,
+          campaignId,
+          contactId,
+          jobId: lockToken,
+          lockOwnerJobId: lockResult.ownerToken,
+        },
+        "Skipping duplicate/overlapping call job due to active lock",
+      );
+      return;
+    }
+
+    if (lockResult.recovered) {
+      log.warn(
+        {
+          event: "call_lock_recovered_stalled_job",
+          tenantId,
+          campaignId,
+          contactId,
+          jobId: lockToken,
+        },
+        "Recovered stalled job ownership for active-call lock",
+      );
+    }
+  } catch (err) {
+    log.error(
+      { err, tenantId, campaignId, contactId, jobId: lockToken, lockKey },
+      "Failed to acquire active-call lock (fail-closed)",
+    );
+    throw err;
+  }
+
+  try {
 
   // -- Step 3: Atomic call limit increment + create call record --
   const newCallCount = await tenantDal.incrementCallsUsed();
@@ -547,6 +656,10 @@ async function processCallJob(job, config) {
 
   // -- Step 8: Inject recording consent into script --
   const enhancedScript = complianceGate.injectRecordingConsent(campaign.script || "");
+  // Unbundled pipeline reads campaigns.system_prompt (LLM system message); must reach CallBridge cfg.
+  const enhancedSystemPrompt = complianceGate.injectRecordingConsent(
+    campaign.system_prompt || campaign.script || "",
+  );
 
   // -- Step 9: Start call bridge (ElevenLabs runtime) --
   const voicePipeline = resolveVoicePipeline(campaign, tenant);
@@ -567,8 +680,10 @@ async function processCallJob(job, config) {
       id: campaignId,
       name: campaign.name,
       script: enhancedScript,
+      system_prompt: enhancedSystemPrompt,
       questions: campaign.questions,
       voice_id: campaign.voice_id,
+      tts_model: campaign.tts_model || null,
       first_message: campaign.first_message || null,
       whatsapp_followup_template: campaign.whatsapp_followup_template,
       whatsapp_followup_link: campaign.whatsapp_followup_link,
@@ -698,15 +813,25 @@ async function processCallJob(job, config) {
       retryQueueName: CALL_QUEUE_NAME,
     });
   } else {
-    // Successful call.
-    await callDal.update(callId, {
-      status: "completed",
-      duration_seconds: bridgeResult.duration_seconds,
-    });
-    await campaignContactDal.updateStatus(campaignContactId, "completed", {
-      call_id: callId,
-      attempt_count: campaignContact.attempt_count + 1,
-    });
+    const updatedCall = finalCallRow;
+    const isCallbackRequested = updatedCall?.lead_status === "callback";
+
+    if (isCallbackRequested) {
+      await scheduleRequestedCallback({
+        callId,
+        campaignContactId,
+        campaignContact,
+        updatedCall,
+        job,
+        log,
+        campaignContactDal,
+      });
+    } else {
+      await campaignContactDal.updateStatus(campaignContactId, "completed", {
+        call_id: callId,
+        attempt_count: campaignContact.attempt_count + 1,
+      });
+    }
   }
 
   // Send WhatsApp for hot/warm leads (if not already sent by tool).
@@ -751,6 +876,24 @@ async function processCallJob(job, config) {
     },
     "Call job processing complete"
   );
+  } finally {
+    if (lockAcquired) {
+      try {
+        const released = await releaseCallLock(redis, lockKey, lockToken);
+        if (!released) {
+          log.warn(
+            { event: "call_lock_release_not_owner", tenantId, campaignId, contactId, jobId: lockToken, lockKey },
+            "Active-call lock release skipped because ownership changed",
+          );
+        }
+      } catch (err) {
+        log.error(
+          { err, tenantId, campaignId, contactId, jobId: lockToken, lockKey },
+          "Active-call lock release failed (best effort)",
+        );
+      }
+    }
+  }
 }
 
 // ─── Retry / Daily Cap Helper (T11.2 / T11.3 — sole writer) ────────
@@ -845,21 +988,181 @@ async function handleRetryDecision({
   await enqueueRetry({ job, retryQueueName, delayMs });
 }
 
+export async function handleScheduleBlockedReschedule({
+  db,
+  log,
+  job,
+  campaign,
+  campaignContactId,
+  retryQueueName,
+  enqueueRetryFn = enqueueRetry,
+}) {
+  const now = new Date();
+  const nextWindow = getNextScheduleWindow(
+    campaign.schedule_windows || [],
+    campaign.schedule_days || [],
+    now,
+  );
+
+  if (!nextWindow) {
+    log.warn(
+      { campaignId: campaign.id, metric: "schedule_no_valid_window" },
+      "No valid schedule window found, marking needs_attention",
+    );
+    await db
+      .from("campaign_contacts")
+      .update({ status: "needs_attention", updated_at: new Date().toISOString() })
+      .eq("id", campaignContactId);
+    return;
+  }
+
+  const today = israelTodayIso();
+  const { data: cc } = await db
+    .from("campaign_contacts")
+    .select("daily_retry_count, last_retry_day")
+    .eq("id", campaignContactId)
+    .single();
+
+  const newCount = !cc || cc.last_retry_day !== today
+    ? 1
+    : (cc.daily_retry_count || 0) + 1;
+
+  if (newCount > MAX_DAILY_RETRIES) {
+    log.warn(
+      { campaignContactId, newCount, metric: "schedule_reschedule_cap_reached" },
+      "Schedule reschedule cap reached, marking needs_attention",
+    );
+    await db
+      .from("campaign_contacts")
+      .update({
+        status: "needs_attention",
+        daily_retry_count: newCount,
+        last_retry_day: today,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", campaignContactId);
+    return;
+  }
+
+  const delayMs = Math.max(0, nextWindow.getTime() - now.getTime());
+  const nextRetryAt = new Date(now.getTime() + delayMs).toISOString();
+  await db
+    .from("campaign_contacts")
+    .update({
+      status: "queued",
+      next_retry_at: nextRetryAt,
+      daily_retry_count: newCount,
+      last_retry_day: today,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", campaignContactId);
+
+  try {
+    await enqueueRetryFn({ job, retryQueueName, delayMs });
+  } catch (err) {
+    log.error(
+      { err, campaignContactId, nextRetryAt, delayMs },
+      "Schedule reschedule enqueue failed after DB queued update; reverting status",
+    );
+    try {
+      await db
+        .from("campaign_contacts")
+        .update({
+          status: "needs_attention",
+          next_retry_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", campaignContactId);
+    } catch (rollbackErr) {
+      log.error(
+        { err: rollbackErr, campaignContactId, nextRetryAt, delayMs },
+        "Schedule reschedule rollback failed; manual reconciliation required",
+      );
+    }
+    return;
+  }
+  log.info(
+    { campaignContactId, nextRetryAt, delayMs, newCount },
+    "Rescheduled job to next legal window",
+  );
+}
+
+async function scheduleRequestedCallback({
+  callId,
+  campaignContactId,
+  campaignContact,
+  updatedCall,
+  job,
+  log,
+  campaignContactDal,
+}) {
+  const answers =
+    updatedCall?.qualification_answers && typeof updatedCall.qualification_answers === "object"
+      ? updatedCall.qualification_answers
+      : {};
+  const rawTimestamp = typeof answers.callback_timestamp === "string"
+    ? answers.callback_timestamp
+    : "";
+  const parsedMs = Date.parse(rawTimestamp);
+  const fallbackDelayMs = 60 * 60 * 1000;
+  const delayMs = Number.isFinite(parsedMs)
+    ? Math.max(0, parsedMs - Date.now())
+    : fallbackDelayMs;
+
+  if (!Number.isFinite(parsedMs)) {
+    log.warn(
+      { rawTimestamp, contactId: updatedCall?.contact_id, callId },
+      "Failed to parse LLM callback_timestamp, defaulting to 1 hour",
+    );
+  }
+
+  const scheduledAt = new Date(Date.now() + delayMs).toISOString();
+  await campaignContactDal.updateStatus(campaignContactId, "queued", {
+    call_id: callId,
+    attempt_count: campaignContact.attempt_count + 1,
+    next_retry_at: scheduledAt,
+  });
+
+  try {
+    await enqueueRetry({ job, retryQueueName: CALL_QUEUE_NAME, delayMs });
+  } catch (err) {
+    log.error(
+      { err, campaignContactId, delayMs },
+      "Callback enqueue failed after DB queued update; reverting status",
+    );
+    await campaignContactDal.updateStatus(campaignContactId, "needs_attention", {
+      next_retry_at: null,
+      call_id: callId,
+    });
+    return;
+  }
+
+  log.info(
+    { campaignContactId, scheduledAt, delayMs },
+    "Scheduled callback via delayed BullMQ job",
+  );
+}
+
+const queueCache = new Map();
+
+function getQueue(queueName, redisUrl) {
+  if (!queueCache.has(queueName)) {
+    queueCache.set(queueName, new Queue(queueName, { connection: { url: redisUrl } }));
+  }
+  return queueCache.get(queueName);
+}
+
 /**
  * Re-enqueue the same call job onto the call-jobs queue with a delay.
- * Uses a fresh BullMQ Queue handle (cheap — connection pooled by ioredis).
+ * Uses a cached BullMQ Queue handle to prevent connection churn.
  */
 async function enqueueRetry({ job, retryQueueName, delayMs }) {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl) return;
-  const q = new Queue(retryQueueName, { connection: { url: redisUrl } });
-  try {
-    // Strip the snapshot fields so the next dequeue picks fresh ones.
-    const { agentIdUsed, syncVersionUsed, ...freshData } = job.data;
-    await q.add("call", freshData, { delay: delayMs });
-  } finally {
-    await q.close().catch(() => {});
-  }
+  const q = getQueue(retryQueueName, redisUrl);
+  // Strip the snapshot fields so the next dequeue picks fresh ones.
+  const { agentIdUsed, syncVersionUsed, ...freshData } = job.data;
+  await q.add("call", freshData, { delay: delayMs });
 }
 
 /**
@@ -935,13 +1238,16 @@ export function createCallWorker(concurrency = 5, config = {}) {
   }
 
   const connection = { url: redisUrl };
+  let worker;
 
-  const worker = new Worker(
+  worker = new Worker(
     CALL_QUEUE_NAME,
     async (job) => {
+      const redis = config.redis || (await worker.client);
       await processCallJob(job, {
         gatewayApi: config.gatewayApi,
         log,
+        redis,
       });
     },
     {

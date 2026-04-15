@@ -19,7 +19,7 @@
  *
  * Producer contract (NOT enforced here):
  *   The enqueueing side (dashboard server actions) MUST set
- *     jobId: `agent-sync:${campaignId}`
+ *     jobId: `agent-sync-${campaignId}` (no ":" — BullMQ rejects colons in custom ids)
  *     delay: 2000
  *   so BullMQ collapses bursts of edits into a single trailing job.
  */
@@ -281,7 +281,7 @@ async function handleDelete(supabase, row, snapshotSyncVersion, log) {
     await supabase
       .from("campaigns")
       .update({
-        agent_status: null,
+        agent_status: "pending",
         elevenlabs_agent_id: null,
         agent_sync_error: null,
         agent_synced_at: new Date().toISOString(),
@@ -300,7 +300,7 @@ async function handleDelete(supabase, row, snapshotSyncVersion, log) {
     await supabase
       .from("campaigns")
       .update({
-        agent_status: null,
+        agent_status: "pending",
         elevenlabs_agent_id: null,
         agent_sync_error: null,
         agent_synced_at: new Date().toISOString(),
@@ -315,12 +315,13 @@ async function handleDelete(supabase, row, snapshotSyncVersion, log) {
 
 // ─── EL payload builder ────────────────────────────────────────────
 
-function buildAgentPayload(row) {
-  // Canonical prompt source is campaigns.script (per 001_initial_schema.sql).
-  // There is no dedicated first_message column on campaigns → omit the field
-  // entirely and let EL drive the opening turn from the system prompt.
+export function buildAgentPayload(row) {
   const agent = {
-    prompt: { prompt: row.script || "" },
+    first_message: row.first_message ?? null,
+    prompt: {
+      prompt: row.system_prompt || row.script || "",
+      tools: buildElevenLabsClientTools(),
+    },
     language: "he",
   };
 
@@ -330,15 +331,12 @@ function buildAgentPayload(row) {
       agent,
       tts: {
         voice_id: row.voice_id,
-        // tts_model is filled by BEFORE INSERT trigger from platform_settings;
-        // fall back defensively to a known default here just in case.
         model_id: row.tts_model || "eleven_turbo_v2_5",
       },
-    },
-    platform_settings: {
-      widget: {
-        // All Spec A tools are side-effect-bearing → execution_mode=post_tool_speech.
-        tools: buildElevenLabsClientTools(),
+      // speculative_turn cannot be flipped via PATCH after create — must be set here.
+      turn: {
+        mode: "turn",
+        speculative_turn: false,
       },
     },
   };

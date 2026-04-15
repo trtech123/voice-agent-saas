@@ -1,0 +1,9 @@
+{
+  "conversation_config": {
+    "turn": {
+      "turn_timeout": 12,
+      "turn_eagerness": "patient",
+      "speculative_turn": false
+    }
+  }
+}

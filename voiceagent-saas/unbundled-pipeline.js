@@ -69,34 +69,62 @@ class UnbundledPipelineError extends Error {
 
 // ─── Boot-synthesized audio cache ────────────────────────────────────────
 //
-// Pre-synthesized once at module load. Played zero-latency during tool calls
-// (filler) or on most failure paths (error TTS).
+// Cached per (model_id, voice_id). Played during tool calls (filler) or on
+// failure paths (error TTS). Must match the live TTSSession model/voice.
 
-let _bootSynthesisDone = false;
-let _fillerPcm = Buffer.alloc(0);
-let _errorPcm = Buffer.alloc(0);
+const _bootSynthCache = new Map();
 
 const FILLER_TEXT = "רגע אחד";
 const ERROR_TEXT = "סליחה, יש לי בעיה טכנית, אני מתקשר שוב מאוחר יותר";
 
-async function bootSynthesizeOnce(apiKey, logger) {
-  if (_bootSynthesisDone) return;
-  _bootSynthesisDone = true;
+const DEFAULT_TTS_MODEL = "eleven_turbo_v2_5";
+
+/** EL stream-input + HTTP /stream reject some dashboard/Convai model IDs (runtime: 403/400). */
+const STREAM_INPUT_UNSUPPORTED_MODELS = new Set(["eleven_v3_conversational"]);
+// Default turbo (not multilingual_v2): on many Hebrew voices multilingual_v2 skews toward
+// Arabic-colored prosody; Convai / pre-unbundled paths often behaved closer to turbo.
+const STREAM_TTS_FALLBACK_MODEL =
+  process.env.ELEVENLABS_TTS_STREAM_FALLBACK_MODEL || "eleven_turbo_v2_5";
+
+/** Voice + latency defaults for unbundled TTS (HTTP one-shot + stream-input). Tunable via env. */
+function unbundledTtsVoiceSettings() {
+  return {
+    stability: env("ELEVENLABS_TTS_STABILITY", 0.62),
+    similarity_boost: env("ELEVENLABS_TTS_SIMILARITY", 0.72),
+    speed: env("ELEVENLABS_TTS_SPEED", 1.0),
+  };
+}
+
+function unbundledTtsOptimizeLatency() {
+  return env("ELEVENLABS_TTS_OPTIMIZE_STREAMING_LATENCY", 2);
+}
+
+async function getBootSynthBuffers(apiKey, logger, modelId, voiceId) {
+  const key = `${modelId}\0${voiceId}`;
+  const hit = _bootSynthCache.get(key);
+  if (hit) return hit;
   try {
-    _fillerPcm = await synthesizeOneShot(apiKey, FILLER_TEXT, logger);
-    _errorPcm = await synthesizeOneShot(apiKey, ERROR_TEXT, logger);
+    const filler = await synthesizeOneShot(apiKey, FILLER_TEXT, logger, voiceId, modelId);
+    const errorBuf = await synthesizeOneShot(apiKey, ERROR_TEXT, logger, voiceId, modelId);
+    const pair = { filler, error: errorBuf };
+    _bootSynthCache.set(key, pair);
     logger.info(
-      { fillerBytes: _fillerPcm.length, errorBytes: _errorPcm.length },
+      { fillerBytes: filler.length, errorBytes: errorBuf.length, modelId, voiceId },
       "unbundled boot synthesis complete",
     );
+    return pair;
   } catch (err) {
-    logger.warn({ err: err.message }, "unbundled boot synthesis failed (fallback to silence)");
+    logger.warn(
+      { err: err.message, modelId, voiceId },
+      "unbundled boot synthesis failed (fallback to silence)",
+    );
+    return { filler: Buffer.alloc(0), error: Buffer.alloc(0) };
   }
 }
 
-async function synthesizeOneShot(apiKey, text, logger) {
+async function synthesizeOneShot(apiKey, text, logger, voiceId, modelId) {
   // Use the EL HTTP /stream endpoint (NOT WebSocket) — simpler one-shot.
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}/stream?output_format=pcm_16000`;
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=pcm_16000`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -105,8 +133,8 @@ async function synthesizeOneShot(apiKey, text, logger) {
     },
     body: JSON.stringify({
       text,
-      model_id: "eleven_turbo_v2_5",
-      voice_settings: { stability: 0.5, similarity_boost: 0.8, speed: 1.0 },
+      model_id: modelId,
+      voice_settings: unbundledTtsVoiceSettings(),
     }),
   });
   if (!res.ok) throw new Error(`EL HTTP ${res.status}`);
@@ -156,6 +184,10 @@ export class UnbundledPipeline extends EventEmitter {
     this._roundCountThisCall = 0;
     this._bargeTimestamps = [];
     this._lastTtsAudioAt = 0;
+    this._fillerPcm = Buffer.alloc(0);
+    this._errorPcm = Buffer.alloc(0);
+    /** @type {string | undefined} cached resolved stream model (see `_ttsModelId`) */
+    this._cachedTtsModelId = undefined;
 
     // Counters surfaced to call-bridge for call_metrics
     this.metrics = {
@@ -177,14 +209,59 @@ export class UnbundledPipeline extends EventEmitter {
     };
   }
 
+  /** Campaign voice from dashboard; else `ELEVENLABS_VOICE_ID` or bundled default. */
+  _ttsVoiceId() {
+    const id = this.campaign?.voice_id;
+    if (typeof id === "string" && id.trim().length > 0) return id.trim();
+    return VOICE_ID;
+  }
+
+  /** Campaign TTS model from dashboard; else `ELEVENLABS_TTS_MODEL`; else turbo default. */
+  _ttsModelId() {
+    if (this._cachedTtsModelId !== undefined) return this._cachedTtsModelId;
+
+    let m = null;
+    const c = this.campaign?.tts_model;
+    if (typeof c === "string" && c.trim().length > 0) m = c.trim();
+    else if (typeof process.env.ELEVENLABS_TTS_MODEL === "string" && process.env.ELEVENLABS_TTS_MODEL.trim())
+      m = process.env.ELEVENLABS_TTS_MODEL.trim();
+    else m = DEFAULT_TTS_MODEL;
+
+    if (STREAM_INPUT_UNSUPPORTED_MODELS.has(m)) {
+      this.log.warn(
+        { requestedModel: m, usingModel: STREAM_TTS_FALLBACK_MODEL },
+        "campaign tts_model not supported on ElevenLabs stream-input; using fallback",
+      );
+      this._cachedTtsModelId = STREAM_TTS_FALLBACK_MODEL;
+      return this._cachedTtsModelId;
+    }
+    this._cachedTtsModelId = m;
+    return m;
+  }
+
+  _newTtsSession() {
+    return new TTSSession({
+      apiKey: this.apiKeys.elevenlabs,
+      voiceId: this._ttsVoiceId(),
+      modelId: this._ttsModelId(),
+      voiceSettings: unbundledTtsVoiceSettings(),
+      optimizeStreamingLatency: unbundledTtsOptimizeLatency(),
+      logger: this.log.child ? this.log.child({ component: "tts" }) : this.log,
+    });
+  }
+
   /** Open Deepgram WS, run boot synthesis (once per process), prepare. */
   async connect() {
     if (this._state !== STATE.IDLE) {
       this.log.warn({ state: this._state }, "connect() called in non-IDLE state");
       return;
     }
-    // Boot synthesis (once per process; cheap subsequent calls)
-    await bootSynthesizeOnce(this.apiKeys.elevenlabs, this.log);
+    const modelId = this._ttsModelId();
+    const voiceId = this._ttsVoiceId();
+    this.log.info({ ttsModel: modelId, voiceId }, "unbundled tts config");
+    const boot = await getBootSynthBuffers(this.apiKeys.elevenlabs, this.log, modelId, voiceId);
+    this._fillerPcm = boot.filler;
+    this._errorPcm = boot.error;
 
     // Install max-duration kill switch
     this._maxDurationTimer = setTimeout(() => {
@@ -253,11 +330,16 @@ export class UnbundledPipeline extends EventEmitter {
       business_name: this.tenant?.name || "",
       ...(this.contact?.custom_fields || {}),
     };
-    const { systemPrompt, firstMessage } = buildFromCampaign({
+    let { systemPrompt, firstMessage } = buildFromCampaign({
       systemPrompt: this.campaign?.system_prompt,
       firstMessage: this.campaign?.first_message,
       dynamicVariables,
     });
+
+    if (systemPrompt) {
+      systemPrompt +=
+        "\n\n[כלל קשיח] השב תמיד בעברית ישראלית בלבד. אסור לך לדבר או לכתוב בערבית, גם אם הלקוח מדבר ערבית או ערבית-עברית.";
+    }
 
     if (!systemPrompt || !firstMessage) {
       this.log.error("campaign missing system_prompt or first_message — cannot start unbundled conversation");
@@ -274,11 +356,7 @@ export class UnbundledPipeline extends EventEmitter {
 
     // 3. Play the greeting through a fresh TTSSession
     this._setState(STATE.GREETING);
-    const tts = new TTSSession({
-      apiKey: this.apiKeys.elevenlabs,
-      voiceId: VOICE_ID,
-      logger: this.log.child ? this.log.child({ component: "tts" }) : this.log,
-    });
+    const tts = this._newTtsSession();
     this._currentTts = tts;
     this._wireTtsHandlers(tts);
     try {
@@ -374,11 +452,7 @@ export class UnbundledPipeline extends EventEmitter {
     this._currentLlm = llm;
 
     // Open a fresh TTS session for this turn
-    const tts = new TTSSession({
-      apiKey: this.apiKeys.elevenlabs,
-      voiceId: VOICE_ID,
-      logger: this.log.child ? this.log.child({ component: "tts" }) : this.log,
-    });
+    const tts = this._newTtsSession();
     this._currentTts = tts;
     this._wireTtsHandlers(tts);
     let ttsStarted = false;
@@ -467,8 +541,8 @@ export class UnbundledPipeline extends EventEmitter {
     let fillerScheduled = setTimeout(() => {
       if (this._state !== STATE.TOOL_RUNNING) return;
       this._setState(STATE.FILLER_AUDIO);
-      if (_fillerPcm.length > 0) {
-        this.emit("agent_audio", _fillerPcm);
+      if (this._fillerPcm.length > 0) {
+        this.emit("agent_audio", this._fillerPcm);
       }
     }, FILLER_DELAY_MS);
 
@@ -525,8 +599,8 @@ export class UnbundledPipeline extends EventEmitter {
   }
 
   async _playErrorAndClose(reason) {
-    if (_errorPcm.length > 0) {
-      this.emit("agent_audio", _errorPcm);
+    if (this._errorPcm.length > 0) {
+      this.emit("agent_audio", this._errorPcm);
     }
     await new Promise((r) => setTimeout(r, 200));
     this.close(reason);
@@ -634,4 +708,4 @@ export class UnbundledPipeline extends EventEmitter {
   }
 }
 
-export { UnbundledPipelineError, bootSynthesizeOnce };
+export { UnbundledPipelineError };

@@ -88,6 +88,7 @@ describe("TTSSession — start()", () => {
     expect(bos.text).toBe(" ");
     expect(bos.voice_settings).toEqual({ stability: 0.5, similarity_boost: 0.8, speed: 1.0 });
     expect(bos.xi_api_key).toBe("key1"); // EL footgun: required in body too
+    expect(bos.language_code).toBe("he");
   });
 
   it("retries once on initial WS error after 300ms", async () => {

@@ -16,6 +16,7 @@
  */
 
 import WebSocket from "ws";
+import crypto from "node:crypto";
 import { getActiveBridge } from "./call-bridge.js";
 
 const ASTERISK_MEDIA_FORMAT = String(process.env.ASTERISK_MEDIA_FORMAT || "slin16").toLowerCase();
@@ -85,6 +86,16 @@ function parseAsteriskControlMessage(message) {
 export function registerGatewayMediaSocket(app, gatewayState) {
   app.get("/asterisk-media", { websocket: true }, (asteriskSocket, request) => {
     const url = new URL(request.url, "http://localhost");
+    
+    // Auth validation
+    const token = url.searchParams.get("token");
+    const expectedToken = process.env.SIP_GATEWAY_API_KEY;
+    if (!expectedToken || !token || token.length !== expectedToken.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))) {
+      app.log.warn("Rejected Asterisk media connection: unauthorized token");
+      asteriskSocket.close(1008, "Unauthorized");
+      return;
+    }
+
     const callId = url.searchParams.get("callId") || url.searchParams.get("call_id");
     const sipCallId = url.searchParams.get("sipCallId") || url.searchParams.get("sip_call_id");
 

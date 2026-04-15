@@ -119,8 +119,13 @@ export const TOOL_CATALOG = [
           description:
             "When the lead wants to be called back (free text, e.g. '\u05DE\u05D7\u05E8 \u05D1\u05D1\u05D5\u05E7\u05E8')",
         },
+        callback_timestamp: {
+          type: "STRING",
+          description:
+            "The exact UTC time for the callback in ISO 8601 format (e.g., 2026-04-16T15:30:00Z). Calculate this from the current time context in the system instructions.",
+        },
       },
-      required: ["preferred_time"],
+      required: ["preferred_time", "callback_timestamp"],
     },
     openai: {
       properties: {
@@ -129,8 +134,13 @@ export const TOOL_CATALOG = [
           description:
             "When the lead wants to be called back (free text, e.g. '\u05DE\u05D7\u05E8 \u05D1\u05D1\u05D5\u05E7\u05E8')",
         },
+        callback_timestamp: {
+          type: "string",
+          description:
+            "The exact UTC time for the callback in ISO 8601 format (e.g., 2026-04-16T15:30:00Z). Calculate this based on the current time provided in your system instructions.",
+        },
       },
-      required: ["preferred_time"],
+      required: ["preferred_time", "callback_timestamp"],
     },
   },
   {
@@ -272,11 +282,19 @@ async function handleScoreLead(args, ctx) {
   const status = String(args.status);
   const answers = args.answers ?? {};
 
+  const existingCall = typeof ctx.dal.calls.getById === "function"
+    ? await ctx.dal.calls.getById(ctx.callId)
+    : null;
+  const existingAnswers =
+    existingCall?.qualification_answers && typeof existingCall.qualification_answers === "object"
+      ? existingCall.qualification_answers
+      : {};
+
   // Persist to calls table
   await ctx.dal.calls.update(ctx.callId, {
     lead_score: score,
     lead_status: status,
-    qualification_answers: answers,
+    qualification_answers: { ...existingAnswers, ...answers },
   });
 
   return { success: true, score, status };
@@ -312,23 +330,38 @@ async function handleSendWhatsApp(args, ctx) {
 
 async function handleRequestCallback(args, ctx) {
   const preferredTime = String(args.preferred_time ?? "");
+  const callbackTimestamp = String(args.callback_timestamp ?? "");
+  const existingCall = typeof ctx.dal.calls.getById === "function"
+    ? await ctx.dal.calls.getById(ctx.callId)
+    : null;
+  const existingAnswers =
+    existingCall?.qualification_answers &&
+      typeof existingCall.qualification_answers === "object"
+      ? existingCall.qualification_answers
+      : {};
 
   // Update call record with callback status
   await ctx.dal.calls.update(ctx.callId, {
     lead_status: "callback",
-    qualification_answers: { callback_preferred_time: preferredTime },
+    qualification_answers: {
+      ...existingAnswers,
+      callback_preferred_time: preferredTime,
+      callback_timestamp: callbackTimestamp,
+    },
   });
 
   // Log audit event
   await ctx.dal.auditLog.log("callback_requested", "call", ctx.callId, {
     contactId: ctx.contactId,
     preferredTime,
+    callbackTimestamp,
   });
 
   return {
     success: true,
     callback_requested: true,
     preferred_time: preferredTime,
+    callback_timestamp: callbackTimestamp,
   };
 }
 
