@@ -1,13 +1,13 @@
 # Voice Agent SaaS
 
-Hebrew outbound AI voice agent SaaS for Israeli SMBs. Calls leads, qualifies them with Gemini AI, scores them, sends WhatsApp follow-ups.
+Hebrew outbound AI voice agent SaaS for Israeli SMBs. Calls leads, qualifies them with AI (ElevenLabs Convai or unbundled Deepgram+OpenAI pipeline), scores them, sends WhatsApp follow-ups.
 
 ## Architecture
 
 ```
 Dashboard (Railway)  →  BullMQ (Railway Redis)  →  Voice Engine (DO droplet)  →  Asterisk  →  Voicenter SIP  →  Phone
                                                          ↕
-                                                   Gemini 3.1 Flash Live (Google AI Studio)
+                                              ElevenLabs Convai or Unbundled (Deepgram+OpenAI+EL TTS)
 ```
 
 ## Deployment
@@ -81,16 +81,26 @@ voice-agent-marketing/
 │   └── database/           # Supabase types, DAL, encryption
 ├── voiceagent-saas/        # Plain JS merged process (deployed on droplet)
 │   ├── server.js           # Fastify + ARI + BullMQ bootstrap
-│   ├── call-bridge.js      # Gemini Live audio bridge
+│   ├── call-bridge.js      # ElevenLabs / Unbundled audio bridge
 │   ├── call-processor.js   # BullMQ job processor
-│   ├── gemini-session.js   # Gemini WebSocket manager
+│   ├── elevenlabs-session.js       # ElevenLabs Convai WebSocket manager
+│   ├── elevenlabs-tools-adapter.js # EL tool definitions adapter
+│   ├── agent-sync-processor.js     # ElevenLabs agent config sync worker
+│   ├── live-turn-writer.js         # Postgres-backed call_turns writer
+│   ├── janitor.js                  # Stuck call cleanup / dead letter handler
+│   ├── unbundled-pipeline.js       # Deepgram + OpenAI + EL TTS orchestrator
+│   ├── deepgram-session.js         # Deepgram STT WebSocket client
+│   ├── llm-session.js              # OpenAI GPT-4o-mini streaming client
+│   ├── tts-session.js              # ElevenLabs TTS WebSocket client
+│   ├── vad.js                      # Voice Activity Detection (silence detector)
+│   ├── vad-config.js               # VAD configuration constants
 │   ├── agent-prompt.js     # Hebrew prompt builder
-│   ├── tools.js            # Gemini tool definitions
-│   ├── compliance.js       # DNC, schedule, audit
-│   ├── whatsapp-client.js  # Green API client
-│   ├── audio-utils.js      # slin16 downsample (24k→16k)
-│   ├── media-bridge.js     # Asterisk ExternalMedia handler
-│   └── ari-client.js       # Asterisk ARI client
+│   ├── tools.js             # Tool definitions (EL + OpenAI schemas)
+│   ├── compliance.js        # DNC, schedule, audit
+│   ├── whatsapp-client.js   # WhatsApp client
+│   ├── media-bridge.js      # Asterisk ExternalMedia handler
+│   ├── ari-client.js        # Asterisk ARI client
+│   └── scripts/             # CLI tools (migrate-campaign, probe-*)
 ├── asterisk-gateway/       # Old separate gateway (replaced by voiceagent-saas/)
 ├── supabase/
 │   └── migrations/         # SQL migrations
@@ -108,15 +118,60 @@ voice-agent-marketing/
 ### Droplet env vars (/opt/voiceagent-saas/.env):
 ```
 PORT=8091
+PUBLIC_BASE_URL=http://188.166.166.234:8091
+SIP_GATEWAY_API_KEY=<key>
+SIP_GATEWAY_EVENTS_SECRET=<key>
+
+# Asterisk ARI
+ASTERISK_ARI_BASE_URL=http://127.0.0.1:8088/ari
+ASTERISK_ARI_USERNAME=<user>
+ASTERISK_ARI_PASSWORD=<password>
+ASTERISK_ARI_APP=voiceagent-saas-media
+
+# Voicenter SIP
+VOICENTER_PJSIP_ENDPOINT=voicenter_trunk
+VOICENTER_SIP_SERVER=185.138.169.235
+VOICENTER_SIP_USERNAME=<user>
+VOICENTER_SIP_PASSWORD=<password>
+VOICENTER_CALLER_ID=<caller_id>
+VOICENTER_TRANSPORT=udp
+
+# Audio format — slin16 eliminates ulaw transcoding
 ASTERISK_MEDIA_FORMAT=slin16
+ASTERISK_MEDIA_CONNECTION_NAME=voiceagent_saas_media
+
+# Gemini (legacy fallback)
+GEMINI_API_KEY=<key>
 GEMINI_LIVE_MODEL=models/gemini-3.1-flash-live-preview
 GEMINI_VOICE_NAME=Kore
-GEMINI_API_KEY=<key>
-VOICENTER_PJSIP_ENDPOINT=voicenter_trunk
+GEMINI_WATCHDOG_IDLE_NUDGE_SEC=45
+
+# Supabase
 SUPABASE_URL=https://uwintyhbdslivrvttfzp.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<key>
+SUPABASE_DIRECT_DB_URL=postgres://postgres.ref:<password>@aws-1-eu-central-1.pooler.supabase.com:6543/postgres
+
+# Encryption
+CREDENTIAL_KEK=<base64-encoded-key>
+
+# Redis (Railway public URL for BullMQ)
 REDIS_URL=redis://default:<pass>@junction.proxy.rlwy.net:47885
-USE_VERTEX_AI=false  # Set to true when gemini-3.1 is available on Vertex AI EU
+
+# ElevenLabs
+ELEVENLABS_API_KEY=<key>
+
+# Vertex AI EU (low latency)
+USE_VERTEX_AI=false
+GCP_PROJECT_ID=<project>
+GCP_LOCATION=europe-west1
+GOOGLE_APPLICATION_CREDENTIALS=/opt/voiceagent-saas/gcp-service-account.json
+
+# VAD tuning
+VAD_RMS_THRESHOLD=800
+VAD_SILENCE_DEBOUNCE_MS=700
+VAD_SANITY_GAP_MS=2000
+VAD_CONSECUTIVE_SILENT_FRAMES=3
+VAD_AGENT_AUDIO_TAIL_MS=200
 ```
 
 #### Unbundled voice pipeline env vars (plan 1, 2026-04-08):

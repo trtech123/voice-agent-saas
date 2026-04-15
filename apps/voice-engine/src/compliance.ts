@@ -16,7 +16,7 @@
 
 import type { AuditLogDAL, TenantDAL, ContactDAL, Campaign } from "@vam/database";
 import type { DncEnforcer } from "./dnc.js";
-import { isWithinSchedule } from "./schedule.js";
+import { isWithinSchedule, type ScheduleWindow } from "./schedule.js";
 
 /** Hebrew recording consent disclosure (Israeli law requirement). */
 const RECORDING_CONSENT_TEXT =
@@ -101,7 +101,7 @@ export class ComplianceGate {
 
     // 2. Schedule check
     const scheduleResult = isWithinSchedule(
-      campaign.schedule_windows,
+      campaign.schedule_windows as unknown as ScheduleWindow[],
       campaign.schedule_days
     );
 

@@ -1,6 +1,6 @@
 // packages/database/src/dal/audit-log.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Database, AuditLogEntry } from "../types.js";
+import type { Database, Json, AuditLogEntry } from "../types.js";
 
 export class AuditLogDAL {
   constructor(
@@ -21,7 +21,7 @@ export class AuditLogDAL {
         action,
         entity_type: entityType,
         entity_id: entityId,
-        details: details ?? null,
+        details: (details ?? null) as Json | null,
       });
     if (error) throw error;
   }

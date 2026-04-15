@@ -267,7 +267,7 @@ export async function processCallJob(
   // -- Step 2: Validate preconditions --
   const precondition = await validateCallPreconditions(
     contactId,
-    campaign,
+    campaign as unknown as CampaignSchedule,
     { contacts: contactDal, tenants: tenantDal }
   );
 
@@ -408,7 +408,7 @@ export async function processCallJob(
     contactName: contact.name,
     campaign: {
       script: campaign.script,
-      questions: campaign.questions,
+      questions: campaign.questions as Array<{ question: string; key: string; options?: string[] }>,
       whatsapp_followup_template: campaign.whatsapp_followup_template,
       whatsapp_followup_link: campaign.whatsapp_followup_link,
     },
@@ -419,7 +419,7 @@ export async function processCallJob(
     contact: {
       name: contact.name,
       phone: contact.phone,
-      custom_fields: contact.custom_fields,
+      custom_fields: (contact.custom_fields ?? {}) as Record<string, unknown>,
     },
     toolContext,
     voicenterClient,
